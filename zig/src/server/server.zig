@@ -64,6 +64,9 @@ pub const Server = struct {
     open_connections: std.atomic.Value(u32) = .init(0),
     preparing: std.atomic.Value(i64) = .init(0),
     arena: std.heap.ArenaAllocator,
+    /// --vision: the helper that prepares image and video prompts (null: text only)
+    vision: ?*@import("vision.zig").Helper = null,
+    media_limits: @import("messages.zig").MediaLimits = .{},
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
@@ -136,12 +139,39 @@ pub const Server = struct {
                 };
                 break :blk if (ids.len > 0) ids[0] else null;
             } else srv.text.tokenId("<think>");
-            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close) };
+            request.call = .{
+                .opener = opener.?,
+                .lead = form.?.lead orelse "",
+                .tail = form.?.tail orelse "",
+                .names = names.items,
+                .think_open = think_open,
+                .think_end = srv.text.tokenId(srv.markers.close),
+                .lex = .{ .ctx = srv, .blank = callBlank, .text = callText, .encode = callEncode },
+            };
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
         }
+    }
+
+    fn callBlank(ctx: *anyopaque, token: u32) bool {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        for (srv.text.eosIds()) |e| if (e == token) return false;
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const text = srv.text.decode(fba.allocator(), &.{token}) catch return false;
+        return std.mem.trim(u8, text, " \t\r\n").len == 0;
+    }
+
+    fn callText(ctx: *anyopaque, a: std.mem.Allocator, token: u32) anyerror![]const u8 {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        return srv.text.decode(a, &.{token});
+    }
+
+    fn callEncode(ctx: *anyopaque, a: std.mem.Allocator, text: []const u8) anyerror![]const u32 {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        return srv.text.encode(a, text, false);
     }
 
     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };

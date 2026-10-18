@@ -5,12 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from tensorfold.shards import shard_files
+
 MODEL_TYPES = ("qwen4_exp", "qwen3_8_flash_next")   # the second: the name newer exports (Mia-AiLab's NVFP4) carry
 TITLE = "Qwen3.8 Flash Next"
 LANES = True
 # with their MTP head: MLX affine (4-bit the default; oQ4e, oQ5e, 6- and 8-bit read too), EXL3 and NVFP4
 MODELS = ("TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP", "turboderp/Qwen3.8-Flash-Next-exl3",
-          "local-inference-lab/Qwen3.8-Flash-Next-NVFP4", "RadixArk/Qwen3.8-Flash-Next-NVFP4")
+          "local-inference-lab/Qwen3.8-Flash-Next-NVFP4", "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+          "nvidia/Qwen3.8-Flash-Next-FP4-Local")
 NVFP4_MODELS = MODELS[2:]
 QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt")}  # MLX affine 4-bit, EXL3 packs and NVFP4 (ModelOpt)
 EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
@@ -91,7 +94,7 @@ def check(model_dir: Path) -> None:
     check_quantization(config, "mlx")
     # Config-only preflight cannot establish whether the MTP head is missing; wait for weights or their index.
     if ((Path(model_dir) / "model.safetensors.index.json").is_file()
-            or any(Path(model_dir).glob("model*.safetensors"))) and not has_mtp(model_dir):
+            or any(shard_files(model_dir))) and not has_mtp(model_dir):
         print(f"[tensorfold] this checkpoint has no MTP head: decoding without MTP drafts ({MODELS[0]} has one)",
               flush=True)
 
@@ -108,7 +111,7 @@ def ple_bytes(model_dir: Path) -> int:
     from tensorfold.families.qwen4_exp.host_table import read_header
 
     return sum(entry["data_offsets"][1] - entry["data_offsets"][0]
-               for path in Path(model_dir).glob("model*.safetensors")
+               for path in shard_files(model_dir)
                for name, entry in read_header(path).items() if re.fullmatch(_TABLE, name))
 
 
@@ -126,7 +129,7 @@ def weight_bytes(model_dir: Path, ple_on_ssd: bool = False) -> int:
 
     from tensorfold.families.qwen4_exp.host_table import ngrams_on_host
 
-    size = sum(p.stat().st_size for p in Path(model_dir).glob("*.safetensors"))
+    size = sum(p.stat().st_size for p in shard_files(model_dir, "*.safetensors"))
     return size - ple_bytes(model_dir) if ngrams_on_host(model_dir, ple_on_ssd) else size
 
 
@@ -163,7 +166,7 @@ def kernel_version(model: Any) -> str:
 # the CUDA engine reads MLX affine weights of this (bits, group size), or NVFP4 (ModelOpt) routed experts
 CUDA_QUANTIZATION = (4, 32)
 # the KV cache dtypes the CUDA engine can allocate (``--kv-dtype``)
-CUDA_KV_DTYPES = ("bf16", "int8", "int4")
+CUDA_KV_DTYPES = ("bf16", "int8", "int4", "fp8")
 CUDA_DECODE_SHARE = True           # --parallel rounds size their prompt pass by --decode-share (0: whole passes)
 CUDA_PREFILL_FP8 = True            # --prefill-fp8: an NVFP4 checkpoint's MXFP8 linears have an FP8 prompt kernel
 

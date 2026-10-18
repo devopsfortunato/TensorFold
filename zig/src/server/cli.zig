@@ -33,11 +33,12 @@ pub const flags = [_]Flag{
     .{ .name = "--api-key-file", .native = true },
     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
     .{ .name = "--dashboard", .kind = .store_true, .native = true },
-    .{ .name = "--vision", .kind = .store_true },
-    .{ .name = "--vision-urls", .kind = .store_true },
+    .{ .name = "--vision", .kind = .store_true, .native = true },
+    .{ .name = "--vision-urls", .kind = .store_true, .native = true },
     .{ .name = "--vision-offload", .kind = .store_true },
-    .{ .name = "--vision-max-images" },
-    .{ .name = "--vision-image-tokens" },
+    .{ .name = "--vision-max-images", .native = true },
+    .{ .name = "--vision-max-videos", .native = true },
+    .{ .name = "--vision-image-tokens", .native = true },
     .{ .name = "--context", .native = true },
     .{ .name = "--speed-up", .native = true },
     .{ .name = "--max-tokens", .native = true },
@@ -71,11 +72,11 @@ pub const flags = [_]Flag{
     .{ .name = "--ple-on-ssd", .kind = .store_true },
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda" }, .native = true, .native_values = backend_values },
-    .{ .name = "--tp", .choices = &.{ "1", "2" } },
-    .{ .name = "--rank", .choices = &.{ "0", "1" } },
-    .{ .name = "--master" },
-    .{ .name = "--master-port" },
-    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" } },
+    .{ .name = "--tp", .choices = &.{ "1", "2" }, .native = true },
+    .{ .name = "--rank", .choices = &.{ "0", "1" }, .native = true },
+    .{ .name = "--master", .native = true },
+    .{ .name = "--master-port", .native = true },
+    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4", "fp8" }, .native = true, .native_values = &.{ "bf16", "fp8" } },
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
     .{ .name = "--precision", .choices = &.{ "checkpoint", "full" } },
@@ -110,6 +111,19 @@ pub const Args = struct {
     no_drafts: bool = false,
     parallel: []const u8 = "auto",
     backend: []const u8 = "auto",
+    // two ranks: rank 0 serves the API and leads, rank 1 follows it over the link to --master:--master-port
+    tp: u32 = 1,
+    rank: u32 = 0,
+    master: []const u8 = "",
+    master_port: u16 = 29551,
+    // --vision: image and video input (a helper process runs Python TensorFold's frontend and tower)
+    vision: bool = false,
+    vision_urls: bool = false,
+    vision_max_images: ?i64 = null,
+    vision_max_videos: ?i64 = null,
+    vision_image_tokens: ?i64 = null,
+    // the attention caches' format: bf16 (exact, the default) or fp8 (e4m3 rows, about half the bytes)
+    kv_dtype: []const u8 = "bf16",
 };
 
 /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
@@ -160,6 +174,22 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
         try apply(a, &out, name, value, u, &alias, &keys);
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
+    if (out.rank >= out.tp) return fail(u, a, "argument --rank: {d} is not below --tp {d}", .{ out.rank, out.tp });
+    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other rank", .{out.tp});
+    // serve_options.check: the image options need --vision
+    if (out.vision_urls and !out.vision) return fail(u, a, "--vision-urls needs --vision", .{});
+    if (out.vision_max_images) |n| {
+        if (n < 1 or n > 256) return fail(u, a, "--vision-max-images must be a positive integer (at most 256)", .{});
+        if (!out.vision) return fail(u, a, "--vision-max-images needs --vision", .{});
+    }
+    if (out.vision_max_videos) |n| {
+        if (n < 1 or n > 64) return fail(u, a, "--vision-max-videos must be a positive integer (at most 64)", .{});
+        if (!out.vision) return fail(u, a, "--vision-max-videos needs --vision", .{});
+    }
+    if (out.vision_image_tokens) |n| {
+        if (n < 1 or n > 65536) return fail(u, a, "--vision-image-tokens is a number of tokens from 1 to 65,536", .{});
+        if (!out.vision) return fail(u, a, "--vision-image-tokens needs --vision", .{});
+    }
     out.alias = alias.items;
     out.api_key = keys.items;
     return out;
@@ -191,7 +221,11 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
         out.port = @intCast(p);
-    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v;
+    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v else if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--rank")) out.rank = @intCast(try int(u, a, name, v)) else if (is(name, "--master")) out.master = v else if (is(name, "--vision")) out.vision = true else if (is(name, "--vision-urls")) out.vision_urls = true else if (is(name, "--vision-max-images")) out.vision_max_images = try int(u, a, name, v) else if (is(name, "--vision-max-videos")) out.vision_max_videos = try int(u, a, name, v) else if (is(name, "--vision-image-tokens")) out.vision_image_tokens = try int(u, a, name, v) else if (is(name, "--kv-dtype")) out.kv_dtype = v else if (is(name, "--master-port")) {
+        const p = try int(u, a, name, v);
+        if (p <= 0 or p > 65535) return fail(u, a, "argument --master-port: invalid port: '{s}'", .{v});
+        out.master_port = @intCast(p);
+    }
 }
 
 /// ``--parallel``: "auto" is up to 8 requests at once; a number caps it.
@@ -252,6 +286,12 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqual(@as(usize, 2), args.api_key.len);
     try std.testing.expect(!args.thinking);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter", "x" }, &u));
+    const two = try parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1", "--master-port", "29551" }, &u);
+    try std.testing.expectEqual(@as(u32, 2), two.tp);
+    try std.testing.expectEqual(@as(u32, 1), two.rank);
+    try std.testing.expectEqualStrings("10.0.22.1", two.master);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2" }, &u)); // no --master
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--rank", "1" }, &u)); // rank 1 of 1
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);

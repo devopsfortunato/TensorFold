@@ -4,6 +4,7 @@ pub const abi = @import("abi.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
+pub const system_memory = @import("system_memory.zig");
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 pub const HostBuffer = @import("memory.zig").HostBuffer;
 pub const Stream = @import("stream.zig").Stream;
@@ -17,14 +18,17 @@ pub const Dim3 = launch.Dim3;
 pub const graph = @import("graph.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
+pub const roce = @import("roce.zig");
 pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
 pub const segments = @import("segments.zig");
 
 test {
+    _ = system_memory;
     _ = launch;
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = roce;
 }

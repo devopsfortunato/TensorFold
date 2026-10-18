@@ -61,7 +61,10 @@ def _native_context(model_dir: Path) -> int:
     config = json.loads(path.read_text())
     text = config.get("text_config") or config
     limit = text.get("max_position_embeddings") or config.get("max_position_embeddings")
-    return int(limit) if isinstance(limit, int) and limit > 0 else 0
+    limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
+    from tensorfold.families.qwen4_exp.cuda.yarn import window
+
+    return window(text, limit)                   # Flash Next under YaRN: factor x the native window
 
 
 class App:

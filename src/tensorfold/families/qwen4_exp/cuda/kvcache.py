@@ -1,4 +1,4 @@
-"""Flash Next's CUDA key/value caches: bf16, or ExLlamaV3's -cq 8 / -cq 4 codes (H32-rotated groups of 32, fp16 absmax scales, midpoint grid) kept rotated."""
+"""Flash Next's CUDA key/value caches: bf16, ExLlamaV3's -cq 8 / -cq 4 codes (H32-rotated groups of 32, fp16 absmax scales, midpoint grid) kept rotated, or FP8 e4m3 rows with a power-of-two scale a head row (kv8.py)."""
 
 from __future__ import annotations
 
@@ -6,10 +6,12 @@ import math
 
 import torch
 
+from . import kv8
+
 GROUP = 32                      # values per scale (ExLlamaV3's cache-quant group)
 SCALE_DTYPE = torch.float16     # ExLlamaV3 stores the group absmax as a half (__float2half_rn)
-DTYPES = ("bf16", "int8", "int4")
-BITS_OF = {"bf16": 16, "int8": 8, "int4": 4}
+DTYPES = ("bf16", "int8", "int4", "fp8")
+BITS_OF = {"bf16": 16, "int8": 8, "int4": 4, "fp8": 8}   # fp8: admission sizes it as int8 (16 bytes a head row more than kv8.row_bytes)
 R32 = 1.0 / math.sqrt(32)
 
 
@@ -26,16 +28,18 @@ def row_bytes(kv_heads: int, head_dim: int, dtype: str) -> int:
 
     if dtype == "bf16":
         return 2 * kv_heads * head_dim * 2
+    if dtype == "fp8":
+        return kv8.row_bytes(kv_heads, head_dim)
     return 2 * kv_heads * (head_dim if dtype == "int8" else head_dim // 2) + 2 * kv_heads * (head_dim // GROUP) * 2
 
 
 # -- storage -------------------------------------------------------------------------------------------
 class KVCache:
-    """One attention layer's keys and values ``[capacity, kv_heads, head_dim]`` (int4: head_dim / 2 bytes); a bf16 cache keeps one-element scales so every kernel takes one argument list."""
+    """One attention layer's keys and values ``[capacity, kv_heads, head_dim]`` (int4: head_dim / 2 bytes; fp8: uint8 key rows of head_dim + 16 bytes holding both scales, value rows of head_dim, kv8.py); bf16 and fp8 caches keep one-element scales so every kernel takes one argument list."""
 
     def __init__(self, capacity: int, kv_heads: int, head_dim: int, device, dtype: str = "bf16") -> None:
         check(dtype)
-        if dtype != "bf16" and head_dim % GROUP:
+        if dtype in ("int8", "int4") and head_dim % GROUP:
             raise ValueError(f"a quantized KV cache needs a head dim that is a multiple of {GROUP}, not {head_dim}")
         self.dtype = dtype
         self.bits = BITS_OF[dtype]
@@ -54,6 +58,12 @@ class KVCache:
             groups = (int(capacity), int(kv_heads), int(head_dim) // GROUP)
             self.ks = torch.zeros(groups, dtype=SCALE_DTYPE, device=device)
             self.vs = torch.zeros(groups, dtype=SCALE_DTYPE, device=device)
+        elif dtype == "fp8":
+            self.k = torch.zeros((int(capacity), int(kv_heads), kv8.key_bytes(int(head_dim))), dtype=torch.uint8,
+                                 device=device)
+            self.v = torch.zeros(shape, dtype=torch.uint8, device=device)
+            self.ks = torch.zeros((1,), dtype=SCALE_DTYPE, device=device)
+            self.vs = torch.zeros((1,), dtype=SCALE_DTYPE, device=device)
         else:
             self.k = torch.zeros(shape, dtype=torch.bfloat16, device=device)
             self.v = torch.zeros_like(self.k)
@@ -62,7 +72,13 @@ class KVCache:
 
     @property
     def quantized(self) -> bool:
-        return self.dtype != "bf16"
+        """int8 / int4: codes with per-group scale tensors and the H32 rotation (the kernels' BITS path)."""
+        return self.dtype in ("int8", "int4")
+
+    @property
+    def fp8(self) -> bool:
+        """FP8 rows (kv8.py's kernels; scales inside the key rows)."""
+        return self.dtype == "fp8"
 
     @property
     def nbytes(self) -> int:

@@ -39,6 +39,10 @@ pub const Rules = struct {
     min_gap: u32 = 256,
     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
     min_prompt: u32 = 4096,
+    /// A prompt this long or longer that the store has served before (the same tokens, any earlier request) keeps a state
+    /// at its second-to-last token, so the next repeat resumes there and prefills one row. 0: off. The first sighting
+    /// pays nothing; a repeat pays one extra call once.
+    repeat_min: u32 = 0,
 };
 
 pub const Entry = struct {
@@ -70,8 +74,10 @@ pub const Store = struct {
     entries: std.ArrayList(*Entry) = .empty,
     counts: Counts = .{},
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
+    seen_keys: std.ArrayList(u64) = .empty, // whole prompts served, hashed (at most SEEN_KEYS; Rules.repeat_min)
 
     const SHARED_KEYS = 64;
+    const SEEN_KEYS = 256;
 
     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
         return .{ .gpa = gpa, .family = family, .rules = rules, .budget = budget };
@@ -81,7 +87,31 @@ pub const Store = struct {
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
         s.shared_keys.deinit(s.gpa);
+        s.seen_keys.deinit(s.gpa);
         s.held = 0;
+    }
+
+    /// A served prompt is noted (after its prefill), so a repeat of it keeps a state one row short of its end.
+    pub fn noteServed(s: *Store, prompt: []const u32) void {
+        if (s.rules.repeat_min == 0 or prompt.len < s.rules.repeat_min) return;
+        const k = sharedKey(prompt);
+        if (std.mem.indexOfScalar(u64, s.seen_keys.items, k) != null) return;
+        if (s.seen_keys.items.len == SEEN_KEYS) _ = s.seen_keys.orderedRemove(0);
+        s.seen_keys.append(s.gpa, k) catch {};
+    }
+
+    /// `marks_` (owned by `a`) plus the repeat mark at the prompt's second-to-last token, when this prompt was served
+    /// before, no kept state reaches that far, and no mark sits there already.
+    fn withRepeat(s: *const Store, a: Allocator, prompt: []const u32, from: u32, marks_: []const u32) ![]const u32 {
+        if (s.rules.repeat_min == 0 or prompt.len < s.rules.repeat_min or prompt.len < 2) return marks_;
+        if (std.mem.indexOfScalar(u64, s.seen_keys.items, sharedKey(prompt)) == null) return marks_;
+        const at: u32 = @intCast(prompt.len - 1);
+        if (at <= from or at + s.rules.lookahead > prompt.len or std.mem.indexOfScalar(u32, marks_, at) != null) return marks_;
+        const out = try a.alloc(u32, marks_.len + 1);
+        @memcpy(out[0..marks_.len], marks_);
+        out[marks_.len] = at;
+        a.free(marks_);
+        return out;
     }
 
     fn free(s: *Store, e: *Entry) void {
@@ -143,7 +173,9 @@ pub const Store = struct {
     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
         const e = s.find(prompt, starts);
         if (e == null) s.counts.misses += 1;
-        const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
+        const from_at: u32 = if (e) |x| x.at else 0;
+        const base = try s.marks(a, prompt, from_at, history_len, shared, starts, if (e) |x| x.last else &.{});
+        const marks_ = try s.fitting(a, try s.withRepeat(a, prompt, from_at, base));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
             const at = if (s.rules.planned) floorStart(starts, w) else w;
             if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead]);

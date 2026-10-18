@@ -16,6 +16,7 @@ from ..host_table import BF16Table, HostTable
 from ..ssd_table import SSDTable
 from .ngram import NGram
 from .qmm import Q4
+from .yarn import Yarn, read as read_yarn
 
 
 def stop_ids(configured: Any, generation: Path) -> tuple[int, ...]:
@@ -76,6 +77,7 @@ class Config:
     quant: str = "mlx"                 # "mlx" (affine 4-bit everywhere) or "modelopt" (NVFP4 routed experts)
     mrope_section: tuple[int, int, int] = (11, 11, 10)   # interleaved t/h/w rotary pairs
     nvfp4_group: int = 16              # the NVFP4 block size (the checkpoint's config_groups weights.group_size)
+    yarn: Yarn | None = None           # YaRN past the native window (yarn.py; None: the default rope)
 
     @classmethod
     def read(cls, model_dir: str | Path) -> "Config":
@@ -115,6 +117,7 @@ class Config:
             eos=eos, group_size=int(quant.get("group_size", 32)), bits=int(quant.get("bits", 4)),
             quant=method, nvfp4_group=group,
             mrope_section=tuple(int(x) for x in rope.get("mrope_section", (11, 11, 10))),
+            yarn=read_yarn(t),
         )
 
     @property

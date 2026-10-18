@@ -120,7 +120,11 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     try fields.probabilityOptions(cx, body);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
-    if (is_chat) {
+    if (is_chat and srv.vision != null and messages.hasVisual(body.get("messages"))) {
+        // image and video parts: split, rendered and prepared with the vision helper (prompt.prepareMedia)
+        input.media = body.get("messages");
+        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+    } else if (is_chat) {
         input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {

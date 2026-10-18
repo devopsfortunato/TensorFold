@@ -25,6 +25,28 @@ const kernels = [_]Kernel{
     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+    // Flash Next (qwen4_exp): copies of its extensions' device code (zig/tests/cuda/copies.py), the same flags
+    .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
+    .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
+    .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
+    .{ .name = "fn_gdn_tree", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
+    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"} }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
+    .{ .name = "fn_qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
+    .{ .name = "fn_qmm_prefill", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
+    .{ .name = "fn_pack", .flags = &.{"-O3"} }, // ours: the n-gram table's GPU gather (flashnext/cuda_weights.zig)
+    .{ .name = "torch_fn_ops", .src = "torch_ops/fn_ops", .flags = torch_ops }, // ours: Flash Next torch ops (SwiGLU, sampler packing)
+    .{ .name = "torch_fn_logsumexp", .src = "torch_ops/fn_logsumexp", .flags = torch_ops }, // ours: torch.logsumexp in ATen's order
+    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"} }, // ours: routed NVFP4 experts reading weights once a prompt call (fn_nvfp4_experts' bits)
+    .{ .name = "fn_experts_tile", .flags = &.{"-O3"} }, // ours: routed NVFP4 experts in shared-memory row tiles of 64 pairs (fn_nvfp4_experts' bits)
+    // INT4-AutoRound checkpoint (GPTQ int4 experts and head, 128x128-block FP8 dense linears)
+    .{ .name = "fn_qmmf", .flags = &.{"-O3"} }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
+    .{ .name = "fn_int4", .flags = &.{"-O3"} }, // ours: GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
+    .{ .name = "fn_prompt", .flags = &.{"-O3"} }, // cuda/nvfp4/prompt.cu (MXFP8 prompt GEMM), tensorfold_nvfp4_prompt_v1
+    .{ .name = "fn_qmmf_ld", .flags = &.{"-O3"} }, // fn_qmmf.cu with an output row stride (tools/zig/flashnext_qmmf_ld.py)
+    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"} }, // ours (decode D3): fn_nvfp4_experts' unit arithmetic in other launch shapes
+    .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // ours (decode D5): qmm_kernel's K-slice cluster forms for the MTP head in 4-bit
+    .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce.zig)
+    .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // ours: attention._scores' bits from row tiles (the prompt indexer)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -50,12 +72,16 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     options.addOption(bool, "with_kernels", with);
     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cuda.addOptions("kernel_options", options);
+    // the one-shot RoCE all-gather's proxy (decode D1): plain C over libibverbs' header, the library opened at run time
+    // (roce_proxy_stub.c, which refuses every open, where /usr/include has no infiniband/verbs.h)
+    const verbs = if (std.Io.Dir.accessAbsolute(b.graph.io, "/usr/include/infiniband/verbs.h", .{})) |_| true else |_| false;
+    cuda.addCSourceFile(.{ .file = b.path(if (verbs) "zig/src/cuda/roce_proxy.c" else "zig/src/cuda/roce_proxy_stub.c"), .flags = &.{ "-std=gnu11", "-O2", "-idirafter", "/usr/include" } });
     cuda.addImport("stagger", stagger(b, target, optimize));
     if (with) for (kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -65,7 +91,12 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("core", core);
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer };
+    // Flash Next on CUDA: its root sits beside the Metal family's host files (config.zig), which it shares
+    const flashnext = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    flashnext.addImport("cuda", cuda);
+    flashnext.addImport("core", core);
+    flashnext.addImport("lanes", lanes);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -96,29 +127,39 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     cli.addImport("core", mods.core);
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
+    cli.addImport("flashnext", mods.flashnext);
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     runner.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
-    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer);
+    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer);
+    // Flash Next's two-rank transport test (zig/tests/cuda/flashnext/box/comm.sh): its own step, not in `install`
+    const comm_test = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/comm_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
+    b.step("flashnext-comm", "tf-flashnext-comm RANK MASTER PORT: two-rank all-gathers, exact and timed").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-comm", .root_module = comm_test }), .{}).step);
+    // Flash Next's weights against the oracle's digests (zig/tests/cuda/flashnext/weights_check.zig): its own step
+    const weights_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
+    b.step("flashnext-weights", "tf-flashnext-weights SNAPSHOT [WEIGHTS.json]: the loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-weights", .root_module = weights_check }), .{}).step);
+    // the CSF scale decoder against a checkpoint tensor (zig/tests/cuda/flashnext/csf_check.zig): host only
+    const csf_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/csf_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "flashnext", .module = mods.flashnext } } });
+    b.step("flashnext-csf", "tf-flashnext-csf SHARD NAME N K: sha256 of one projection's decoded CSF scales").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-csf", .root_module = csf_check }), .{}).step);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "flashnext", .module = flashnext } },
     });
     return .{ .api = api, .engines = mod };
 }
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module) void {
-    const m = engines(b, target, optimize, cuda, lanes, nemotron);
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module) void {
+    const m = engines(b, target, optimize, cuda, lanes, nemotron, flashnext);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
@@ -137,13 +178,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.flashnext).engines;
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
+    cli.addImport("flashnext", mods.flashnext);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
 }
 

@@ -9,12 +9,22 @@ pub const DeviceBuffer = struct {
     d: *const Driver,
     ptr: abi.DevicePtr,
     len: usize,
+    system: ?@import("system_memory.zig").Region = null,
 
     /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
         var p: abi.DevicePtr = 0;
         if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
         return .{ .d = d, .ptr = p, .len = len };
+    }
+
+    /// Only for a caller which has checked ATS support on the current CUDA device.
+    pub fn allocSystem(d: *const Driver, len: usize) !DeviceBuffer {
+        if (len == 0) return alloc(d, 0);
+        var r = try @import("system_memory.zig").Region.alloc(len);
+        errdefer r.deinit();
+        try @import("system_memory.zig").register(d, r.base, r.reserved);
+        return .{ .d = d, .ptr = r.base, .len = len, .system = r };
     }
 
     /// Allocates and fills from host bytes in one call.
@@ -26,7 +36,12 @@ pub const DeviceBuffer = struct {
     }
 
     pub fn free(self: *DeviceBuffer) void {
-        if (self.ptr != 0) _ = self.d.api.cuMemFree_v2(self.ptr);
+        if (self.system) |*r| {
+            // munmap has no CUDA ordering semantics. Never recycle memory still used by a kernel.
+            if (self.d.api.cuCtxSynchronize() != 0) @panic("system buffer GPU fence failed");
+            @import("system_memory.zig").unregister(self.d, r.base);
+            r.deinit();
+        } else if (self.ptr != 0) _ = self.d.api.cuMemFree_v2(self.ptr);
         self.* = undefined;
     }
 
@@ -135,3 +150,49 @@ pub const HostBuffer = struct {
         return std.mem.bytesAsSlice(T, self.bytes[0 .. self.bytes.len / @sizeOf(T) * @sizeOf(T)]);
     }
 };
+
+test "system DeviceBuffer free fences and does not call cuMemFree" {
+    const Mock = struct {
+        var fences: usize = 0;
+        var frees: usize = 0;
+        var unregisters: usize = 0;
+        fn register(_: ?*anyopaque, _: usize, _: c_uint) callconv(.c) c_int {
+            return 0;
+        }
+        fn unregister(_: ?*anyopaque) callconv(.c) c_int {
+            unregisters += 1;
+            return 0;
+        }
+        fn device(out: *u64, ptr: ?*anyopaque, _: c_uint) callconv(.c) c_int {
+            out.* = @intFromPtr(ptr);
+            return 0;
+        }
+        fn sync() callconv(.c) c_int {
+            fences += 1;
+            return 0;
+        }
+        fn freeDevice(_: u64) callconv(.c) c_int {
+            frees += 1;
+            return 0;
+        }
+    };
+    var d: Driver = undefined;
+    d.api.cuCtxSynchronize = Mock.sync;
+    d.api.cuMemFree_v2 = Mock.freeDevice;
+    d.api.cuMemHostRegister_v2 = Mock.register;
+    d.api.cuMemHostUnregister = Mock.unregister;
+    d.api.cuMemHostGetDevicePointer_v2 = Mock.device;
+    Mock.fences = 0;
+    Mock.frees = 0;
+    Mock.unregisters = 0;
+    var b = try DeviceBuffer.allocSystem(&d, 256);
+    try std.testing.expect(b.system != null);
+    b.free();
+    try std.testing.expectEqual(@as(usize, 1), Mock.fences);
+    try std.testing.expectEqual(@as(usize, 0), Mock.frees);
+    try std.testing.expectEqual(@as(usize, 1), Mock.unregisters);
+    var native: DeviceBuffer = .{ .d = &d, .ptr = 1, .len = 256 };
+    native.free();
+    try std.testing.expectEqual(@as(usize, 1), Mock.fences);
+    try std.testing.expectEqual(@as(usize, 1), Mock.frees);
+}

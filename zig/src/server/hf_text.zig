@@ -115,7 +115,8 @@ pub const HfText = struct {
         return .{ .object = out };
     }
 
-    /// config.json's eos_token_id (one or a list), else the tokenizer's eos_token.
+    /// config.json's eos_token_id (one or a list) and the tokenizer's eos_token, as Python's tokenizer wrapper
+    /// stops on both (Qwen3.8 Flash Next: config 248044 <|endoftext|>, tokenizer 248046 <|im_end|>).
     fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
         var out: std.ArrayList(u32) = .empty;
         if (model_config == .object) {
@@ -127,7 +128,7 @@ pub const HfText = struct {
                     .array => |list| for (list.items) |x| if (x == .integer) try out.append(a, @intCast(x.integer)),
                     else => {},
                 }
-                if (out.items.len > 0) return out.items;
+                if (out.items.len > 0) break;
             }
         }
         if (config == .object) if (config.object.get("eos_token")) |e| {
@@ -136,7 +137,7 @@ pub const HfText = struct {
                 .object => |o| if (o.get("content")) |c| (if (c == .string) c.string else "") else "",
                 else => "",
             };
-            if (t.tok.specialTokenId(piece)) |id| try out.append(a, id);
+            if (t.tok.specialTokenId(piece)) |id| if (std.mem.indexOfScalar(u32, out.items, id) == null) try out.append(a, id);
         };
         return out.items;
     }

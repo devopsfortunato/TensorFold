@@ -23,6 +23,10 @@ const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follo
 const Result = struct { rows: u32, keep: u32, got: []const u32 };
 const Unread = struct { event: usize, handle: u64 };
 
+/// The host's hook for incremental fills: `err` null once the stream joined the rounds (or finished at its first
+/// token), else why its fill ended (error.Cancelled for a cancel); the stream is then released.
+pub const FillHook = struct { ptr: *anyopaque, done: *const fn (ptr: *anyopaque, s: *Stream, err: ?anyerror) void };
+
 pub const Engine = struct {
     gpa: Allocator,
     cfg: *const Config,
@@ -38,6 +42,8 @@ pub const Engine = struct {
     steps: u64 = 0,
     arena: std.heap.ArenaAllocator, // a round's temporaries
     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
+    filling: std.ArrayList(*Stream) = .empty, // streams whose prompts fill between rounds (backends with prefill_step)
+    fill_hook: ?FillHook = null, // told when a filling stream's prompt is in (null error) or its fill ended without it
 
     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
         return .{
@@ -56,6 +62,8 @@ pub const Engine = struct {
                 .mtp_step_ms = cfg.mtp_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
+                .head_stops = cfg.head_stops,
+                .head_stops_most = cfg.head_stops_most,
                 .batch_rows = cfg.batch_rows,
             },
         };
@@ -63,6 +71,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.live.deinit(e.gpa);
+        e.filling.deinit(e.gpa);
         e.unread.deinit(e.gpa);
         e.rule.deinit();
         e.arena.deinit();
@@ -83,6 +92,105 @@ pub const Engine = struct {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
         };
+        return e.joinStream(s);
+    }
+
+    /// Whether the backend prefills a burst of prompts together.
+    pub fn batches(e: *const Engine) bool {
+        return e.backend.vtable.prefill_many != null and !e.fills();
+    }
+
+    /// Prefill several streams' prompts in one backend call (`batches`); each is then joined with `addPrefilled`.
+    /// `error.BurstRefused`: nothing ran, `addStream` them one at a time.
+    pub fn prefillBurst(e: *Engine, ss: []const *Stream) !void {
+        _ = e.arena.reset(.retain_capacity);
+        for (ss) |s| try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        const many = e.backend.vtable.prefill_many orelse return error.BurstRefused;
+        many(e.backend.ptr, ss) catch |err| {
+            if (err == error.Cancelled) for (ss) |s| e.backend.release(s);
+            return err;
+        };
+    }
+
+    /// A stream prefilled by `prefillBurst`: draw its first token and ask for its first drafts (addStream's second half).
+    pub fn addPrefilled(e: *Engine, s: *Stream) !void {
+        return e.joinStream(s);
+    }
+
+    /// Whether the backend fills prompts in slices between rounds (prefill_begin and prefill_step).
+    pub fn fills(e: *const Engine) bool {
+        return e.backend.vtable.prefill_begin != null and e.backend.vtable.prefill_step != null;
+    }
+
+    /// Admit a stream: with incremental fills its prompt starts filling (true; `fill_hook` hears when it is in),
+    /// else addStream prefills it now (false).
+    pub fn beginStream(e: *Engine, s: *Stream) !bool {
+        if (!e.fills()) {
+            try e.addStream(s);
+            return false;
+        }
+        _ = e.arena.reset(.retain_capacity);
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        e.backend.vtable.prefill_begin.?(e.backend.ptr, s) catch |err| {
+            if (err == error.Cancelled) e.backend.release(s);
+            return err;
+        };
+        e.filling.append(e.gpa, s) catch |err| {
+            e.backend.release(s);
+            return err;
+        };
+        return true;
+    }
+
+    /// Streams whose prompts are still filling.
+    pub fn fillingCount(e: *const Engine) usize {
+        return e.filling.items.len;
+    }
+
+    /// One slice of every filling prompt; a prompt that is in joins the rounds (its first token, first drafts).
+    fn advanceFills(e: *Engine) !void {
+        const n = e.filling.items.len;
+        const streams = try e.gpa.dupe(*Stream, e.filling.items);
+        defer e.gpa.free(streams);
+        const states = try e.gpa.alloc(be.FillState, n);
+        defer e.gpa.free(states);
+        @memset(states, .filling);
+        e.backend.vtable.prefill_step.?(e.backend.ptr, streams, states) catch |err| {
+            e.filling.clearRetainingCapacity();
+            for (streams) |s| e.endFill(s, err, false);
+            return;
+        };
+        var kept: usize = 0;
+        for (streams, states) |s, st| {
+            if (st == .filling) {
+                e.filling.items[kept] = s;
+                kept += 1;
+            }
+        }
+        e.filling.shrinkRetainingCapacity(kept);
+        for (streams, states) |s, st| switch (st) {
+            .filling => {},
+            .cancelled => e.endFill(s, error.Cancelled, false),
+            .done => {
+                if (e.joinStream(s)) |_| {
+                    if (e.fill_hook) |h| h.done(h.ptr, s, null);
+                } else |err| e.endFill(s, err, err == error.Cancelled); // a cancel at its end released it already
+            },
+        };
+    }
+
+    /// A fill that ended without its stream joining: the stream is released and the host told why.
+    fn endFill(e: *Engine, s: *Stream, err: anyerror, released: bool) void {
+        if (!s.finished) {
+            s.finished = true;
+            s.reason = if (err == error.Cancelled) .cancelled else .@"error";
+            if (!released) e.backend.release(s);
+        }
+        if (e.fill_hook) |h| h.done(h.ptr, s, err);
+    }
+
+    /// The prompt is in: draw the first token, ask for the first drafts, and join the rounds.
+    fn joinStream(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token
             e.backend.release(s);
             return error.Cancelled;
@@ -93,20 +201,34 @@ pub const Engine = struct {
         const position: u64 = s.prompt_len;
         const drawn = try e.backend.first(s, position);
         var feed: Feed = .{ .handle = drawn };
-        if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+        const forced = try e.forcedNext(s);
+        if (forced) |t| feed = .{ .value = t };
+        // tool_choice required: the prompt's first token is the answer's first, so a drawn one passes the gate too (the
+        // first drafts, the next step and rank 1's mirrored calls then start from the replaced token); a forced one
+        // (a budget close, the gate's own fix) is committed as it is
+        if (s.gate != null and forced == null) feed = .{ .value = try e.correctCall(s, try e.readFeed(feed)) };
         var asked: ?u32 = null;
-        if (e.cfg.family_mtp and s.drafts) {
+        if (e.cfg.family_mtp and s.drafts and !e.cfg.join_batch) {
             // the head reads the prompt's last row and the first token, and drafts the one after it
             const d: u32 = @intCast(try e.rule.depth(win.who(s)));
             asked = d;
             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
             s.dropHeld(e.gpa);
             s.next = .{ .count = d };
-        } else if (e.cfg.pipelined) {
+            // the drafts the head holds (a stop rule may end the chain short of the ask), as askDrafts reads them
+            if (e.backend.vtable.tree) |tree| {
+                if (try tree(e.backend.ptr, s, e.gpa)) |held| s.next = held;
+            }
+        } else if (!(e.cfg.family_mtp and s.drafts) and e.cfg.pipelined) {
             try e.queueNext(s, feed);
         }
         const value = try e.readFeed(feed);
         if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+        if (e.cfg.family_mtp and s.drafts and e.cfg.join_batch) {
+            // the first token goes out now; its first drafts come with the next round's other joiners (joinDrafts)
+            s.dropHeld(e.gpa);
+            s.join_draft = true;
+        }
         if (e.log != null) {
             const first = if (feed == .handle) value else try e.backend.read(drawn);
             try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
@@ -122,6 +244,36 @@ pub const Engine = struct {
         try e.live.append(e.gpa, s);
     }
 
+    /// The first drafts of every stream that joined since the last round, in one request batch: the head reads each
+    /// prompt's last row and its first token (already sent) and drafts the ones after it.
+    fn joinDrafts(e: *Engine) !void {
+        var reqs: std.ArrayList(be.DraftRequest) = .empty;
+        defer reqs.deinit(e.gpa);
+        for (e.live.items) |s| {
+            if (!s.join_draft) continue;
+            s.join_draft = false;
+            if (s.finished or s.paused) continue;
+            // a forced fix or budget close queued: its tokens are the next rows, no drafts to hold
+            const d: u32 = if (s.gate != null and s.force.items.len > 0) 0 else @intCast(try e.rule.depth(win.who(s)));
+            try reqs.append(e.gpa, .{ .stream = s, .follow = &.{}, .first = .{ .value = s.pending.? }, .rows = null, .start = s.prompt_len, .position = s.prompt_len + 1, .depth = d });
+        }
+        if (reqs.items.len == 0) return;
+        // in batches of the streams one head step takes (one at a time for a backend without shared rounds)
+        const per: usize = @max(1, e.cfg.batch_streams);
+        var at: usize = 0;
+        while (at < reqs.items.len) : (at += per) try e.backend.draft(reqs.items[at..@min(reqs.items.len, at + per)]);
+        for (reqs.items) |r| {
+            const s = r.stream;
+            s.dropHeld(e.gpa);
+            s.next = .{ .count = r.depth };
+            // the drafts the head holds (a stop rule may end the chain short of the ask), as askDrafts reads them
+            if (e.backend.vtable.tree) |tree| {
+                if (try tree(e.backend.ptr, s, e.gpa)) |held| s.next = held;
+            }
+            try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = &.{s.pending.?} }), f("rows", .null) });
+        }
+    }
+
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {
         try e.live.append(e.gpa, s);
@@ -131,6 +283,12 @@ pub const Engine = struct {
     pub fn discard(e: *Engine, s: *Stream) void {
         s.finished = true;
         s.reason = .cancelled;
+        for (e.filling.items, 0..) |x, i| {
+            if (x == s) {
+                _ = e.filling.orderedRemove(i);
+                break;
+            }
+        }
         for (e.live.items, 0..) |x, i| {
             if (x == s) {
                 _ = e.live.orderedRemove(i);
@@ -142,6 +300,14 @@ pub const Engine = struct {
 
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
+        // prompts filling between rounds take their slice first; one that is in joins this round
+        if (e.filling.items.len > 0) {
+            _ = e.arena.reset(.retain_capacity);
+            try e.advanceFills();
+        }
+        // the stop rule the head uses may depend on how many streams are live (cuda_lanes' served hybrid)
+        e.rule.live = e.live.items.len;
+        try e.joinDrafts();
         _ = e.arena.reset(.retain_capacity);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
@@ -382,9 +548,20 @@ pub const Engine = struct {
         }
         const budget_cut = s.thinkCut(committed.items);
         const loop_cut = sm.loopCut(s, committed.items);
-        const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
+        const call_cut = if (s.gate) |*g| try g.cut(a, committed.items) else null;
+        const loop_at = if (loop_cut) |c| c else std.math.maxInt(usize);
+        const budget_at = if (budget_cut) |c| c else std.math.maxInt(usize);
+        const call_at = if (call_cut) |c| c.at else std.math.maxInt(usize);
         var cut: ?usize = null;
-        if (loop_wins) {
+        if (call_at <= loop_at and call_at < budget_at and call_cut != null) {
+            const hit = call_cut.?;
+            cut = hit.at;
+            path = path[0 .. hit.at + 1];
+            committed.shrinkRetainingCapacity(hit.at);
+            try committed.append(a, hit.fix[0]);
+            s.force.clearRetainingCapacity();
+            if (hit.fix.len > 1) try s.force.appendSlice(e.gpa, hit.fix[1..]);
+        } else if (loop_at < budget_at and loop_cut != null) {
             cut = loop_cut;
             path = path[0 .. loop_cut.? + 1];
             committed.shrinkRetainingCapacity(loop_cut.? + 1);
@@ -523,9 +700,14 @@ pub const Engine = struct {
         }
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
-        if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        const forced = try e.forcedNext(s);
+        if (forced) |t| current = .{ .value = t };
         var token: u32 = undefined;
-        if (mode == .drain) {
+        if (s.gate != null) {
+            token = try e.readFeed(current);
+            if (forced == null) token = try e.correctCall(s, token);
+            if (mode == .drain) s.mode = .verify else try e.queueNext(s, .{ .value = token });
+        } else if (mode == .drain) {
             token = try e.readFeed(current); // the last queued step: no new one
             s.mode = .verify;
         } else {
@@ -546,8 +728,10 @@ pub const Engine = struct {
     fn landInflight(e: *Engine, s: *Stream) !void {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
-        if (try e.forcedNext(s)) |t| current = .{ .value = t };
-        const token = try e.readFeed(current);
+        const forced = try e.forcedNext(s);
+        if (forced) |t| current = .{ .value = t };
+        var token = try e.readFeed(current);
+        if (forced == null) token = try e.correctCall(s, token);
         s.rounds += 1;
         const landed = try s.commit(e.gpa, &.{token});
         s.pending = token;
@@ -564,6 +748,16 @@ pub const Engine = struct {
             const i = try log.add(&.{ f("ev", str("queue")), f("stream", str(s.id)), f("position", int(s.cache_len)), f("token", .null) });
             try e.unread.append(e.gpa, .{ .event = i, .handle = h });
         }
+    }
+
+    /// A sampled token that breaks a required tool call becomes the fix's first token; the rest are forced.
+    fn correctCall(e: *Engine, s: *Stream, token: u32) !u32 {
+        const g = &(s.gate orelse return token);
+        const hit = (try g.cut(e.arena.allocator(), &.{token})) orelse return token;
+        if (hit.at != 0 or hit.fix.len == 0) return token;
+        s.force.clearRetainingCapacity();
+        if (hit.fix.len > 1) try s.force.appendSlice(e.gpa, hit.fix[1..]);
+        return hit.fix[0];
     }
 
     /// The thinking budget's or a forced fix's token at the next position instead of the draw.

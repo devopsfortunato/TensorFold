@@ -75,6 +75,8 @@ pub const Setup = struct {
     started: i96 = 0,
     /// Called once the socket listens, with its port (tests read it).
     on_listen: ?*const fn (port: u16) void = null,
+    /// --vision: the started helper (image and video prompts)
+    vision: ?*@import("vision.zig").Helper = null,
 };
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
@@ -124,6 +126,15 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         return 1;
     };
     defer srv.deinit();
+    if (s.vision) |h| {
+        if (!srv.info.media) {
+            std.debug.print("tensorfold: --vision: this engine takes no image or video rows\n", .{});
+            return 2;
+        }
+        srv.vision = h;
+        srv.media_limits = .{ .max_images = h.settings.max_images, .max_videos = h.settings.max_videos, .allow_urls = h.settings.allow_urls };
+        @import("http_body.zig").limit = 96 * 1024 * 1024;
+    }
     if (args.loop_guard and !srv.info.loop_guard) {
         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
         return 2;

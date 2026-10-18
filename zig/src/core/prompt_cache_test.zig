@@ -370,3 +370,30 @@ test "a state a peer cannot resume is forgotten: the next prompt misses instead 
     try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t2, &.{}));
     try std.testing.expectEqual(s.entries.items.len, f.live);
 }
+
+test "a prompt served before keeps a state one token short of its end, so its repeat prefills one row" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 4096, .repeat_min = 4 }, 1 << 20);
+    defer s.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 9, 9 };
+    var p = try s.begin(a, &prompt, 5, &.{}, &.{}, null); // first sighting: nothing extra
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+    try std.testing.expectEqual(fresh(&prompt), f.pass(&s, &prompt, p));
+    s.noteServed(&prompt);
+    p = try s.begin(a, &prompt, 5, &.{}, &.{}, null); // the repeat: a state at the second-to-last token
+    try std.testing.expectEqual(@as(u32, 0), p.from);
+    try std.testing.expectEqualSlices(u32, &.{6}, p.marks);
+    try std.testing.expectEqual(fresh(&prompt), f.pass(&s, &prompt, p));
+    p = try s.begin(a, &prompt, 5, &.{}, &.{}, null); // the third time: it resumes there and runs one row
+    try std.testing.expectEqual(@as(u32, 6), p.from);
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+    try std.testing.expectEqual(fresh(&prompt), f.pass(&s, &prompt, p));
+    const other = [_]u32{ 1, 2, 3 }; // under repeat_min: never marked
+    s.noteServed(&other);
+    p = try s.begin(a, &other, 0, &.{}, &.{}, null);
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+}

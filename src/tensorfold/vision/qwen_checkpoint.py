@@ -123,3 +123,68 @@ def quantization_predicate(config: dict, weights: dict[str, Any]):
         return settings
 
     return predicate
+
+
+SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2")
+
+
+def quantized_linears(tensors: dict[str, dict]) -> dict[str, tuple[str, list[int]]]:
+    """Group `.weight/.weight_scale/.weight_scale_2` per linear: {weight key: (scheme, dequantized [N, K])}.
+
+    `tensors` maps local names to safetensors header entries. Raises ValueError for a malformed quantized linear.
+    """
+    from tensorfold.cuda.nvfp4.format import scheme
+
+    found = {}
+    for key, item in tensors.items():
+        if not key.endswith(".weight") or key + "_scale" not in tensors:
+            continue
+        scale, global_scale = tensors[key + "_scale"], tensors.get(key + "_scale_2")
+        try:
+            kind = scheme({"weight": (item["dtype"], item["shape"]), "weight_scale": (scale["dtype"], scale["shape"])})
+        except ValueError as error:
+            raise ValueError(f"unsupported quantized vision linear {key}: {error}") from None
+        if kind not in ("nvfp4", "mxfp8") or len(item["shape"]) != 2 or len(scale["shape"]) != 2:
+            raise ValueError(f"unsupported quantized vision linear: {key}")
+        n, stored = item["shape"]
+        k, block = (2 * stored, 16) if kind == "nvfp4" else (stored, 32)
+        if scale["shape"] != [n, -(-k // block)] or (kind == "nvfp4") != (global_scale is not None):
+            raise ValueError(f"quantized vision scale shape mismatch: {key}")
+        if kind == "nvfp4" and (global_scale["dtype"] != "F32" or math.prod(global_scale["shape"]) != 1):
+            raise ValueError(f"vision weight_scale_2 must be one float32: {key}")
+        if kind == "mxfp8" and k % 32:
+            raise ValueError(f"MXFP8 vision weight width must be a multiple of 32: {key}")
+        found[key] = (kind, [n, k])
+    return found
+
+
+def scale_tensors(tensors: dict, quantized: dict) -> set[str]:
+    """Names of the scale tensors folded into `quantized` linears; any other scale tensor is an error."""
+    used = {key + suffix for key in quantized for suffix in ("_scale", "_scale_2") if key + suffix in tensors}
+    stray = [k for k in tensors if k.endswith(SCALE_SUFFIXES) and k not in used]
+    if stray:
+        raise ValueError(f"vision tower has stray quantization scale tensors: {stray[:3]}")
+    return used
+
+
+def is_scale_tensor(name: str) -> bool:
+    return name.endswith(SCALE_SUFFIXES)
+
+
+def dequantize_linear(kind: str, weight, scale, global_scale=None):
+    """float32 [N, K] torch tensor of one NVFP4 (e2m1 x e4m3 per 16 x global) or MXFP8 (e4m3 x 2^(e-127) per 32) weight."""
+    import torch
+
+    if kind == "nvfp4":
+        grid = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6],
+                            dtype=torch.float32, device=weight.device)
+        values = torch.stack((grid[(weight & 0xF).long()], grid[(weight >> 4).long()]), dim=-1)
+        values = values.reshape(weight.shape[0], -1)
+        factor = scale.view(torch.float8_e4m3fn).to(torch.float32).repeat_interleave(16, dim=1)[:, :values.shape[1]]
+        return values * factor * global_scale.to(torch.float32).reshape(())
+    if kind == "mxfp8":
+        e = scale.to(torch.int32)
+        factor = torch.exp2((e - 127).to(torch.float32))
+        factor = torch.where(e == 255, torch.full((), float("nan"), device=scale.device), factor)
+        return weight.view(torch.float8_e4m3fn).to(torch.float32) * factor.repeat_interleave(32, dim=1)
+    raise ValueError(f"unknown quantization scheme: {kind}")
