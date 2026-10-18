@@ -95,6 +95,20 @@ extern "C" __global__ void tf_fn_nucleus_mass_kernel(const __nv_bfloat16* logits
     atomicAdd(&sums[r], (unsigned long long)m);
 }
 
+// Structured output (ours, no torch op): a grammar's bitmask over rows of bf16 logits (`ld` apart). A token outside
+// its row's allowed bits becomes -inf, so the draw after it (argmax, top-k, nucleus) picks among the allowed tokens
+// as the sampler would over masked logits. masks [rows, words] uint32: token c is bit c % 32 of word c / 32; a token
+// past the mask's words is disallowed.
+extern "C" __global__ void tf_fn_grammar_mask_kernel(__nv_bfloat16* logits, uint64_t ld, uint64_t cols,
+                                                     const uint32_t* masks, uint64_t words) {
+    const uint64_t r = blockIdx.y;
+    const uint64_t c = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const uint64_t w = c / 32;
+    if (w < words && ((masks[r * words + w] >> (c % 32)) & 1u)) return;
+    logits[r * ld + c] = __ushort_as_bfloat16((unsigned short)0xff80u);
+}
+
 // nvfp4.matmul with one K slice (SK 1: the shared expert's gate/up, K 2560) and bf16-pattern tables (PACKED 0), the
 // same bits as Triton's `_fp4mm` there: for each 16-input block b in order, p = HMMA.16816.F32.BF16(x rows, the
 // block's 16 x 8 weights, C = 0) and acc = fma(p, S[b, n], acc) (the cubins' HMMA with RZ, then FFMA), the bf16 store
@@ -236,5 +250,14 @@ extern "C" cudaError_t tf_fn_nucleus_mass(const void* logits, uint64_t ld, uint6
     tf_fn_nucleus_mass_kernel<<<dim3(uint32_t((cols + 255) / 256), uint32_t(rows)), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits), ld, cols, t, static_cast<const double*>(top),
         static_cast<int64_t*>(mass), static_cast<unsigned long long*>(sums));
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t tf_fn_grammar_mask(void* logits, uint64_t ld, uint64_t rows, uint64_t cols, const void* masks,
+                                          uint64_t words, cudaStream_t stream) {
+    if (rows == 0 || cols == 0) return cudaSuccess;
+    if (!logits || !masks || words == 0 || ld < cols || rows > 65535) return cudaErrorInvalidValue;
+    tf_fn_grammar_mask_kernel<<<dim3(uint32_t((cols + 255) / 256), uint32_t(rows)), 256, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(logits), ld, cols, static_cast<const uint32_t*>(masks), words);
     return cudaGetLastError();
 }

@@ -312,6 +312,8 @@ pub const Engine = struct {
     nsc: nucleus.Scratch = undefined,
     last_logits: u64,
     last_cand: u64,
+    /// structured output: a window's grammar masks on the device (made by the first structured request)
+    gmask: ?cuda.DeviceBuffer = null,
     /// two ranks: the last shared round's gathered candidates on the host, read once for every window's draws
     cand_host: std.ArrayList(f32) = .empty,
     cand_round: u64 = 0,
@@ -661,6 +663,7 @@ pub const Engine = struct {
         e.gpa.free(e.draft_host);
         e.gpa.free(e.round_segs);
         e.extra.buf.free();
+        if (e.gmask) |*b| b.free();
         if (e.prof) |p| p.deinit(e.gpa);
         e.cand_host.deinit(e.gpa);
         e.memo.deinit();
@@ -1432,6 +1435,54 @@ pub const Engine = struct {
             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
         }
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
+    }
+
+    // -- structured output: a grammar's masks over the main head's rows (one rank) ----------------------------
+
+    /// -inf at each logit of rows [row0, row0 + rows) of `logits_base` that `masks` ([rows, words] uint32 bits, a
+    /// row's allowed tokens) disallows, so the draw after it picks among the allowed tokens.
+    fn maskRows(e: *Engine, logits_base: u64, row0: usize, rows: usize, masks: []const u32) !void {
+        if (e.world > 1) return error.StructuresUnsupported; // a rank's shard and the gathered candidates stay unmasked
+        if (rows == 0 or rows > state.max_rows or masks.len == 0 or masks.len % rows != 0) return error.BadGrammarMask;
+        const V = e.g.head_n;
+        const bytes = masks.len * 4;
+        if (e.gmask == null or e.gmask.?.len < bytes) {
+            if (e.gmask) |*b| b.free();
+            e.gmask = null;
+            e.gmask = try cuda.DeviceBuffer.alloc(e.ctx.d, @max(bytes, state.max_rows * ((V + 31) / 32) * 4));
+        }
+        try e.stream.synchronize(); // the last draw's mask read is done before the upload
+        try e.gmask.?.upload(0, std.mem.sliceAsBytes(masks));
+        try e.f.th.grammarMask(logits_base + row0 * V * 2, V, rows, V, e.gmask.?.ptr, masks.len / rows);
+    }
+
+    /// Window `i`'s rows masked by its stream's grammar (the lanes core's Window.masks), before sampleWindow.
+    pub fn maskWindow(e: *Engine, i: usize, masks: []const u32) !void {
+        if (i >= e.round_n) return error.NoSuchWindow;
+        const sg = e.round_segs[i];
+        try e.maskRows(e.buf.b.logits, sg.a0, sg.a1 - sg.a0, masks);
+    }
+
+    /// The last prompt pass's last logits row on the host: a structured stream draws its first token from it later,
+    /// under its grammar's first mask (drawFirstMasked), after other passes may have reused the device row.
+    pub fn firstRow(e: *Engine, gpa: std.mem.Allocator) ![]u8 {
+        const row = try gpa.alloc(u8, e.g.head_n * 2);
+        errdefer gpa.free(row);
+        try e.read(e.last_logits, row);
+        return row;
+    }
+
+    /// prefillWith's first draw at `position` with sampling `s`, over a kept last row (firstRow) masked by `mask`.
+    pub fn drawFirstMasked(e: *Engine, row: []const u8, mask: []const u32, position: u64, s: ?lanes.Sampling) !u32 {
+        if (row.len != e.g.head_n * 2) return error.BadFirstRow;
+        try e.stream.synchronize();
+        const dev: cuda.DeviceBuffer = .{ .d = e.ctx.d, .ptr = e.last_logits, .len = row.len };
+        try dev.upload(0, row);
+        try e.maskRows(e.last_logits, 0, 1, mask);
+        const smp: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
+        var first: [1]u32 = undefined;
+        try e.drawRows(e.last_logits, e.last_cand, 1, 0, 1, position, smp, &first);
+        return first[0];
     }
 
     /// Keep window `i`'s first `keep` rows (its stream's commit, at its rows of the shared window).

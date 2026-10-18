@@ -120,6 +120,18 @@ const Host = struct {
                     return x.inner.vtable.first(x.inner.ptr, s, position);
                 }
             }.f,
+            .first_masked = if (v.first_masked != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+                    const x = bind(p);
+                    return x.inner.vtable.first_masked.?(x.inner.ptr, s, position, mask);
+                }
+            }.f else null,
+            .held = if (v.held != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.held.?(x.inner.ptr, s, out);
+                }
+            }.f else null,
             .queue = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, feed: lanes.backend.Feed, position: u64) anyerror!u64 {
                     const x = bind(p);
@@ -285,7 +297,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media, .structures = @hasDecl(F, "structures") and F.structures and o.tp <= 1 });
     h.store = null;
     if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
         // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
