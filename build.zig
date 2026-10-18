@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cuda_build = @import("zig/build/cuda.zig");
+const grammar_build = @import("zig/build/grammar.zig");
 
 comptime {
     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
@@ -91,6 +92,7 @@ pub fn build(b: *std.Build) void {
     const flash_host_run = b.addRunArtifact(flash_host);
     b.step("test-flashnext-host", "Run FlashNext CPU metadata contracts without Metal").dependOn(&flash_host_run.step);
     test_step.dependOn(&flash_host_run.step);
+    grammar_build.steps(b, target);
 }
 
 /// `zig build native -Dcpu=apple_m1`: tensorfold-native with the Metal engines for the Python package's bundle (a native M5 build traps on M1-M4).

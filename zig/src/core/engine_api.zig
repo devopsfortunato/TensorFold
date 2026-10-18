@@ -47,7 +47,11 @@ pub const Structure = struct {
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
+    /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
+    compiler: ?*grammar.Compiler = null,
 };
+
+pub const grammar = lanes.grammar;
 
 /// A prompt's images and video frames, prepared by the vision frontend (rows, rotary positions, features).
 pub const Media = lanes.Media;

@@ -216,7 +216,7 @@ pub const LaneHost = struct {
             .@"error" => .failed,
             else => .stop,
         };
-        h.finish(job, reason, "");
+        h.finish(job, reason, job.stream.problem);
         return true;
     }
 
@@ -227,6 +227,7 @@ pub const LaneHost = struct {
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
+            if (s.grammar) |g| g.deinit(h.gpa);
             s.deinit(h.gpa);
             job.proposer.deinit();
         }
@@ -311,6 +312,10 @@ pub const LaneHost = struct {
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.droppedJob(job, "the drafter could not start");
+        const constraint: ?*lanes.grammar.Constraint = if (r.structure) |st| h.constraint(st) catch |e| {
+            job.proposer.deinit();
+            return h.droppedJob(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+        } else null;
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -337,7 +342,9 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .media = r.media,
+            .grammar = constraint,
         }) catch {
+            if (constraint) |g| g.deinit(h.gpa);
             job.proposer.deinit();
             return h.droppedJob(job, "out of memory");
         };
@@ -351,6 +358,12 @@ pub const LaneHost = struct {
         return .dropped;
     }
 
+    /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
+    fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
+        const c = st.compiler orelse return error.NoGrammarCompiler;
+        return c.constraint(h.gpa, h.io, @enumFromInt(@intFromEnum(st.kind)), st.text, st.after);
+    }
+
     /// Every request waiting for a lane, admitted now: prompts that arrive together (a burst, with no resume or kept
     /// state to take) prefill in one backend call, where the backend can (one pass over their rows).
     fn admitAll(h: *LaneHost) void {
@@ -362,7 +375,7 @@ pub const LaneHost = struct {
             .job => |job| {
                 if (h.loneFits(job)) {
                     _ = h.runLone(job, job.began);
-                } else if (n < burst.len and h.core.batches() and job.stream.media == null and job.stream.reuse.at == 0 and job.stream.reuse.marks.len == 0) {
+                } else if (n < burst.len and h.core.batches() and job.stream.media == null and job.stream.grammar == null and job.stream.reuse.at == 0 and job.stream.reuse.marks.len == 0) {
                     burst[n] = job;
                     n += 1;
                 } else _ = h.startOne(job);
