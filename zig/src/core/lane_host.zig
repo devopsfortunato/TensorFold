@@ -312,7 +312,7 @@ pub const LaneHost = struct {
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.droppedJob(job, "the drafter could not start");
-        const constraint: ?*lanes.grammar.Constraint = if (r.structure) |st| h.constraint(st) catch |e| {
+        const grammar: ?*lanes.grammar.Constraint = if (r.structure) |st| h.constraint(st) catch |e| {
             job.proposer.deinit();
             return h.droppedJob(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
         } else null;
@@ -342,9 +342,9 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .media = r.media,
-            .grammar = constraint,
+            .grammar = grammar,
         }) catch {
-            if (constraint) |g| g.deinit(h.gpa);
+            if (grammar) |g| g.deinit(h.gpa);
             job.proposer.deinit();
             return h.droppedJob(job, "out of memory");
         };
