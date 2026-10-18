@@ -6,6 +6,7 @@ const Stream = @import("stream.zig").Stream;
 const Sampling = @import("sampling.zig").Sampling;
 const keyBits = @import("sampling.zig").keyBits;
 const accept = @import("accept.zig");
+const grammar = @import("grammar.zig");
 
 pub const vocab = 97;
 
@@ -61,7 +62,12 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .held = held } };
+    }
+
+    /// The target without its held-drafts read: structured output drops a held chain instead of walking it.
+    pub fn backendHeldless(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
 
     /// The same target filling prompts in slices between rounds (prefill_begin / prefill_step).
@@ -179,6 +185,29 @@ pub const Fake = struct {
         return x.draw(x.lane(s), s, position);
     }
 
+    fn firstMasked(ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const x = self(ptr);
+        const h = try x.draw(x.lane(s), s, position);
+        x.drawn.items[h] = try allowed(x.drawn.items[h], mask);
+        return h;
+    }
+
+    /// Structured output's draw: the first allowed token from the target's own (a function of the row and its bits).
+    fn allowed(token: u32, mask: []const u32) !u32 {
+        if (mask.len == 0) return token;
+        for (0..vocab) |i| {
+            const t: u32 = @intCast((token + i) % vocab);
+            if (grammar.allows(mask, t)) return t;
+        }
+        return error.NoAllowedToken;
+    }
+
+    fn held(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
+        const l = self(ptr).lane(s);
+        if (out.len > l.held.items.len) return error.NotHeld;
+        @memcpy(out, l.held.items[0..out.len]);
+    }
+
     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
         const x = self(ptr);
         const l = x.lane(s);
@@ -213,6 +242,10 @@ pub const Fake = struct {
                 try l.history.appendSlice(x.gpa, path.items);
                 if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
                 o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
+                if (w.masks.len > 0) {
+                    const words = w.masks.len / l.rows.items.len;
+                    o.sampled[r] = try allowed(o.sampled[r], w.masks[r * words ..][0..words]);
+                }
             }
             l.history.shrinkRetainingCapacity(l.base);
             try l.history.appendSlice(x.gpa, l.rows.items); // a chain keeps every row unless rolled back

@@ -20,6 +20,7 @@ pub const Window = struct {
     parents: ?[]const i32, // each row's parent row (row 0: -1) for a tree; null for a chain
     positions: []const u64, // the absolute position each row's draw is keyed at
     early: bool = false, // also draft each row's first head draft behind the verify (speculate_early)
+    masks: []const u32 = &.{}, // structured output: each row's allowed-token bits (rows x words, lanes/grammar.zig); empty: none
 
     pub fn rows(w: Window) usize {
         return 1 + @as(usize, w.held) + w.tokens.len;
@@ -55,6 +56,10 @@ pub const Backend = struct {
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
+        /// `first` with the first token drawn among `mask`'s allowed tokens (structured output; Info.structures backends).
+        first_masked: ?*const fn (ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 = null,
+        /// The stream's held drafts as host tokens in window order, waiting for the draft (a grammar walks them).
+        held: ?*const fn (ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void = null,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.
         queue: *const fn (ptr: *anyopaque, s: *Stream, feed: Feed, position: u64) anyerror!u64,
         /// The value of a drawn token (waits for the GPU).
