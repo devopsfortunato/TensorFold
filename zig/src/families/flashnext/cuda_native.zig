@@ -38,6 +38,11 @@ pub const Options = struct { context: usize, drafts: bool, parallel: u32 = 1, pr
 /// The engine takes image and video rows (Request.media: rotary positions MODE 2, features into the prompt rows).
 pub const media = true;
 
+/// Structured output (response_format, guided_*): each window row's logits masked by the reply's grammar before its
+/// draw, drafts the grammar rejects cut from the window (cuda_engine.maskWindow, drawFirstMasked). One rank only:
+/// at --tp 2 the ranks' shards and gathered candidates are drawn unmasked, so the server refuses such requests there.
+pub const structures = true;
+
 /// --vision: rank 0's vision helper (tensorfold.vision.native_helper) encodes on this GPU beside the engine; its
 /// transient workspace is kept out of the sequences' budget (TENSORFOLD_VISION_WORKSPACE_MIB, 4096 by default
 /// as Python's VISION_WORKSPACE; the tower and the helper's CUDA context are resident before the budget is read).

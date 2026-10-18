@@ -116,6 +116,8 @@ pub fn Lanes(comptime E: type) type {
             fill: ?Filling = null,
             /// the first token's handle of a burst's prompt (firstFn gives it once; else the last one taken)
             first: ?u64 = null,
+            /// structured output: the prompt's last logits row on the host, until its masked first draw
+            first_row: []u8 = &.{},
         };
 
         /// A prompt filling in slices: the engine's fill of the segment in progress (up to the next mark, or to
@@ -208,6 +210,7 @@ pub fn Lanes(comptime E: type) type {
             while (it.next()) |l| {
                 self.stopFill(l.*);
                 self.freeSeqDrained(l.*.seq);
+                self.gpa.free(l.*.first_row);
                 self.gpa.destroy(l.*);
             }
             self.lanes.deinit(self.gpa);
@@ -223,12 +226,14 @@ pub fn Lanes(comptime E: type) type {
             if (@hasDecl(E, "fillBegin") and self.sliced) return .{ .ptr = self, .vtable = &.{
                 .prefill = prefillFn,
                 .first = firstFn,
+                .first_masked = if (@hasDecl(E, "drawFirstMasked")) firstMaskedFn else null,
                 .queue = queueFn,
                 .read = readFn,
                 .verify = verifyFn,
                 .keep = keepFn,
                 .draft = draftFn,
                 .tree = heldFn,
+                .held = heldTokensFn,
                 .release = releaseFn,
                 .prefill_begin = prefillBeginFn,
                 .prefill_step = prefillStepFn,
@@ -236,12 +241,14 @@ pub fn Lanes(comptime E: type) type {
             return .{ .ptr = self, .vtable = &.{
                 .prefill = prefillFn,
                 .first = firstFn,
+                .first_masked = if (@hasDecl(E, "drawFirstMasked")) firstMaskedFn else null,
                 .queue = queueFn,
                 .read = readFn,
                 .verify = verifyFn,
                 .keep = keepFn,
                 .draft = draftFn,
                 .tree = heldFn,
+                .held = heldTokensFn,
                 .release = releaseFn,
                 .prefill_many = if (@hasDecl(E, "prefillMany")) prefillManyFn else null,
             } };
@@ -435,6 +442,7 @@ pub fn Lanes(comptime E: type) type {
                 return;
             }
             _ = self.take(f.fl.first);
+            self.keepFirstRow(s, l) catch |err| return self.lost("a prompt's last row", err);
             self.e.fillFree(f.fl);
             if (f.owned) self.e.freeSnapshot(f.cur.?);
             l.fill = null;
@@ -566,6 +574,20 @@ pub fn Lanes(comptime E: type) type {
                 return self.lost("a prompt's prefill", err);
             };
             _ = self.take(first);
+            self.keepFirstRow(s, l) catch |err| {
+                self.dropLane(s, l);
+                return self.lost("a prompt's last row", err);
+            };
+        }
+
+        /// A structured stream's prompt's last logits row, kept on the host for its masked first draw (firstMaskedFn):
+        /// the device row is the last pass's, and another fill may finish before this stream's first token.
+        fn keepFirstRow(self: *Self, s: *const lanes.Stream, l: *Lane) !void {
+            if (comptime !@hasDecl(E, "firstRow")) return;
+            if (s.grammar == null) return;
+            self.gpa.free(l.first_row);
+            l.first_row = &.{};
+            l.first_row = try self.e.firstRow(self.gpa);
         }
 
         /// A burst of prompts admitted together (no resumes, no marks): their admissions and sequences made first
@@ -578,7 +600,8 @@ pub fn Lanes(comptime E: type) type {
             const e = self.e;
             if (ss.len < 2 or ss.len > max_rows) return error.BurstRefused;
             // an image or video prompt prefills alone (attachMedia, the MODE 2 prompt rows)
-            for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or s.media != null) return error.BurstRefused;
+            // a structured stream keeps its prompt's last row for its masked first draw (keepFirstRow), so it prefills alone
+            for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or s.media != null or s.grammar != null) return error.BurstRefused;
             var ls: [max_rows]*Lane = undefined;
             var made: usize = 0;
             var failure: ?anyerror = null;
@@ -948,6 +971,7 @@ pub fn Lanes(comptime E: type) type {
             try self.settle();
             const l = if (self.lanes.get(s)) |old| blk: {
                 self.freeSeqDrained(old.seq);
+                self.gpa.free(old.first_row);
                 break :blk old;
             } else blk: {
                 const l = try self.gpa.create(Lane);
@@ -1050,6 +1074,7 @@ pub fn Lanes(comptime E: type) type {
             self.reserved -= l.reserved;
             self.forget(l);
             self.freeSeqDrained(l.seq); // a pass that failed mid-prompt left its chunks queued on it
+            self.gpa.free(l.first_row);
             self.gpa.destroy(l);
         }
 
@@ -1069,6 +1094,37 @@ pub fn Lanes(comptime E: type) type {
             };
             if (self.next == 0) return error.NoFirstToken;
             return self.next - 1;
+        }
+
+        /// Structured output's first token: the prompt's last row (keepFirstRow) drawn as prefillWith draws it, among
+        /// the tokens the grammar's first mask allows.
+        fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+            const self = of(ptr);
+            if (comptime !@hasDecl(E, "drawFirstMasked")) return error.StructuresUnsupported;
+            if (position != s.prompt_len) return error.PositionMismatch;
+            const l = self.lanes.get(s) orelse return error.UnknownStream;
+            if (l.first_row.len == 0) return error.NoFirstRow;
+            defer {
+                self.gpa.free(l.first_row);
+                l.first_row = &.{};
+            }
+            l.first = null;
+            return self.take(try self.e.drawFirstMasked(l.first_row, mask, position, s.sampling));
+        }
+
+        /// The drafts the head holds for the stream's next window, as prepareVerify fills them: structured output
+        /// walks them through the grammar first, and sends the ones it keeps back as the window's host tokens.
+        fn heldTokensFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+            const self = of(ptr);
+            const l = self.lanes.get(s) orelse return error.UnknownStream;
+            const pending = s.pending orelse return error.NoPendingToken;
+            for (out, 0..) |*d, j| d.* = if (j < l.held_n) l.held[j] else if (l.held_n > 0) l.held[l.held_n - 1] else pending;
+        }
+
+        /// A window's rows masked by its stream's grammar, before the window's draws.
+        fn maskWindow(self: *Self, i: usize, masks: []const u32) !void {
+            if (comptime !@hasDecl(E, "maskWindow")) return error.StructuresUnsupported;
+            try self.e.maskWindow(i, masks);
         }
 
         fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -1123,6 +1179,7 @@ pub fn Lanes(comptime E: type) type {
             self.round += 1;
             for (windows, out, ls[0..n], 0..) |w, o, l, i| {
                 const rows = w.rows();
+                if (w.masks.len > 0) self.maskWindow(i, w.masks) catch |err| return self.lost("a window's grammar mask", err);
                 e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows]) catch |err| return self.lost("a window's draws", err);
                 @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
                 l.held_n = 0;
@@ -1300,6 +1357,7 @@ pub fn Lanes(comptime E: type) type {
             self.reserved -= kv.value.reserved;
             self.forget(kv.value);
             if (!kept_seq) self.freeSeqDrained(kv.value.seq);
+            self.gpa.free(kv.value.first_row);
             self.gpa.destroy(kv.value);
         }
 
@@ -1513,7 +1571,7 @@ pub const Toy = struct {
         out: []u32,
         drafted: usize = 0,
     };
-    const Held = struct { seq: *Seq, tokens: [max_rows]u32, n: usize };
+    const Held = struct { seq: *Seq, tokens: [max_rows]u32, n: usize, masks: []const u32 = &.{} };
 
     gpa: std.mem.Allocator,
     stream: ?*anyopaque = null, // the engine's stream (cuda_native's records run on it)
@@ -1543,6 +1601,7 @@ pub const Toy = struct {
     /// cuda_engine's snapshot refused for room (budget or MemAvailable floor) after the chunks before it were queued
     refuse_snapshot: bool = false,
     refuse_media: bool = false, // a resumed segment with images is refused (attachMedia's MediaRefused)
+    last_first: u32 = 0, // the last prompt pass's first draw (its "last row", for firstRow)
 
     pub fn next(done: []const u32, extra: []const u32, s: ?lanes.Sampling, position: u64) u32 {
         var h = std.hash.Wyhash.init(11);
@@ -1639,7 +1698,8 @@ pub const Toy = struct {
         }
         t.passes += 1;
         t.drain(); // the first draw reads the logits back
-        return .{ .first = next(q.tokens.items, &.{}, s, prompt.len), .kept = kept };
+        t.last_first = next(q.tokens.items, &.{}, s, prompt.len);
+        return .{ .first = t.last_first, .kept = kept };
     }
 
     /// cuda_engine's Fill: a prompt filling in layer slices; here `left` layers, then prefillWith's effect.
@@ -1764,7 +1824,30 @@ pub const Toy = struct {
         if (i >= t.round_n) return error.ToyMisuse;
         const w = t.round_windows[i];
         const done = w.seq.tokens.items;
-        for (0..w.n) |r| out[r] = next(done, w.tokens[0 .. r + 1], s, done.len + 1 + r);
+        for (0..w.n) |r| {
+            out[r] = next(done, w.tokens[0 .. r + 1], s, done.len + 1 + r);
+            if (w.masks.len > 0) out[r] = try allowed(out[r], w.masks[r * (w.masks.len / w.n) ..][0 .. w.masks.len / w.n]);
+        }
+    }
+    // -- structured output (cuda_engine's maskWindow / firstRow / drawFirstMasked): a masked draw is the first allowed
+    // token from the toy's own, cyclically --
+    fn allowed(token: u32, mask: []const u32) !u32 {
+        for (0..50) |i| {
+            const c: u32 = @intCast((token + i) % 50);
+            if (lanes.grammar.allows(mask, c)) return c;
+        }
+        return error.NoAllowedToken;
+    }
+    pub fn maskWindow(t: *Toy, i: usize, masks: []const u32) !void {
+        if (i >= t.round_n or t.round_windows[i].n == 0 or masks.len % t.round_windows[i].n != 0) return error.ToyMisuse;
+        t.round_windows[i].masks = masks;
+    }
+    pub fn firstRow(t: *Toy, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, std.mem.asBytes(&t.last_first));
+    }
+    pub fn drawFirstMasked(_: *Toy, row: []const u8, mask: []const u32, _: u64, _: ?lanes.Sampling) !u32 {
+        if (row.len != 4) return error.ToyMisuse;
+        return allowed(std.mem.bytesToValue(u32, row[0..4]), mask);
     }
     pub fn commitWindow(t: *Toy, i: usize, keep: usize) !void {
         if (i >= t.round_n) return error.ToyMisuse;
@@ -1825,7 +1908,8 @@ pub const Toy = struct {
     }
 };
 
-const Case = struct { prompt: []const u32, max_new: u32, sampling: ?lanes.Sampling = null, drafts: bool = true };
+/// `want`: structured output under a test grammar (lanes.grammar.Sequence: those tokens, then the toy's 49).
+const Case = struct { prompt: []const u32, max_new: u32, sampling: ?lanes.Sampling = null, drafts: bool = true, want: ?[]const u32 = null };
 
 /// Serial decoding on the toy alone: the tokens every lane run must reproduce.
 fn serialTokens(gpa: std.mem.Allocator, c: Case) ![]u32 {
@@ -1858,8 +1942,21 @@ fn laneTokens(gpa: std.mem.Allocator, cases: []const Case, together: bool, n_str
     defer engine.deinit();
     const streams = try gpa.alloc(lanes.Stream, cases.len);
     defer gpa.free(streams);
-    for (cases, streams) |c, *s| s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .sampling = c.sampling, .drafts = c.drafts });
-    defer for (streams) |*s| s.deinit(gpa);
+    const sequences = try gpa.alloc(lanes.grammar.Sequence, cases.len);
+    defer gpa.free(sequences);
+    const grammars = try gpa.alloc(lanes.grammar.Constraint, cases.len);
+    defer gpa.free(grammars);
+    for (cases, streams, sequences, grammars) |c, *s, *q, *g| {
+        if (c.want) |want| {
+            q.* = .{ .want = want, .stop = 49, .gpa = gpa };
+            g.* = .init(q.rules(), (50 + 31) / 32, null);
+        }
+        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .sampling = c.sampling, .drafts = c.drafts, .grammar = if (c.want != null) g else null });
+    }
+    defer for (cases, streams, sequences) |c, *s, *q| {
+        s.deinit(gpa);
+        if (c.want != null) q.log.deinit(gpa);
+    };
     if (together) {
         for (streams) |*s| try engine.addStream(s);
         while (engine.activeCount() > 0) try engine.step();
@@ -1896,6 +1993,37 @@ test "lane rounds over the toy engine equal serial decoding: one stream at a tim
             const want = try serialTokens(gpa, c);
             defer gpa.free(want);
             try std.testing.expectEqualSlices(u32, want, g);
+        }
+    }
+}
+
+test "structured output over the toy engine: the masked first token, held drafts and window rows keep the reply in its grammar, beside plain streams" {
+    const gpa = std.testing.allocator;
+    const want = [_]u32{ 7, 7, 3, 12, 40, 1, 1, 1, 9, 22, 30, 31, 5, 7, 7, 7, 7, 2 };
+    const cases = [_]Case{
+        .{ .prompt = &.{ 3, 1, 4, 1, 5 }, .max_new = 40, .want = &want },
+        .{ .prompt = &.{ 2, 7, 1, 8, 2, 8 }, .max_new = 64, .sampling = .{ .seed = 9, .temperature = 0.7 } },
+        .{ .prompt = &.{ 6, 6, 6 }, .max_new = 40, .sampling = .{ .seed = 4, .temperature = 0.8 }, .want = &want },
+        .{ .prompt = &.{ 1, 2, 3 }, .max_new = 40, .drafts = false, .want = want[3..] },
+    };
+    for ([_]struct { bool, usize }{ .{ false, 1 }, .{ true, 1 }, .{ true, 4 } }) |run| {
+        const together, const streams = run;
+        var widest: usize = 0;
+        const got = try laneTokens(gpa, &cases, together, streams, &widest);
+        defer {
+            for (got) |g| gpa.free(g);
+            gpa.free(got);
+        }
+        for (cases, got) |c, g| {
+            if (c.want) |w| {
+                try std.testing.expectEqual(w.len + 1, g.len); // the grammar's stop token ends the reply
+                try std.testing.expectEqualSlices(u32, w, g[0..w.len]);
+                try std.testing.expectEqual(@as(u32, 49), g[w.len]);
+            } else {
+                const plain = try serialTokens(gpa, c);
+                defer gpa.free(plain);
+                try std.testing.expectEqualSlices(u32, plain, g);
+            }
         }
     }
 }

@@ -62,6 +62,7 @@ pub const Functions = struct {
     candidates: cuda.Function,
     nucleus_mass: cuda.Function,
     fp4_serial: cuda.Function,
+    grammar_mask: cuda.Function,
     lse: Lse,
 
     pub fn resolve(m: []const cuda.Module) !Functions {
@@ -87,6 +88,7 @@ pub const Functions = struct {
             .candidates = try m[i(.ops)].function("tf_fn_candidates_kernel"),
             .nucleus_mass = try m[i(.ops)].function("tf_fn_nucleus_mass_kernel"),
             .fp4_serial = try m[i(.ops)].function("tf_fn_fp4_serial_kernel"),
+            .grammar_mask = try m[i(.ops)].function("tf_fn_grammar_mask_kernel"),
             .lse = try Lse.resolve(m[i(.lse)]),
         };
     }
@@ -386,6 +388,20 @@ pub const Torch = struct {
         a.add(mass);
         a.add(sums);
         try t.go(t.f.nucleus_mass, .{ (cols + 255) / 256, rows }, 256, &a);
+    }
+
+    /// Structured output (fn_ops.cu, no torch op): -inf at each bf16 logit of `rows` rows (`ld` apart) that its row's
+    /// grammar mask disallows (masks [rows, words] uint32 on the device, token c at bit c % 32 of word c / 32).
+    pub fn grammarMask(t: Torch, logits: u64, ld: usize, rows: usize, cols: usize, masks: u64, words: usize) !void {
+        if (rows == 0 or cols == 0) return;
+        if (words == 0 or ld < cols or rows > 65535) return error.BadGrammarMask;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(u64, ld));
+        a.add(@as(u64, cols));
+        a.add(masks);
+        a.add(@as(u64, words));
+        try t.go(t.f.grammar_mask, .{ (cols + 255) / 256, rows }, 256, &a);
     }
 
     /// nvfp4.matmul with one K slice and bf16-pattern tables (`_fp4mm` SK 1, PACKED 0) in the same bits: each
