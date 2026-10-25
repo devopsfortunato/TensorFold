@@ -137,9 +137,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                       help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
     cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
-    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
-                      help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
-                           "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
+    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4", "fp8"), default="bf16",
+                      help="KV cache: bf16 (the default), int8, int4 or fp8. int8/int4 keys and values use one "
+                           "fp16 scale per 32 values; fp8 stores e4m3 codes with a power-of-two scale per head row, "
+                           "about half of bf16's bytes (all change the output; Flash Next on CUDA only)")
     cuda.add_argument("--prefill-fp8", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                       help="prompt matmuls take FP8 (e4m3) activations, one scale a row, where the checkpoint has an "
                            "FP8 prompt kernel (Qwen3.8 27B and Qwen3.6 MLX 4-bit, NVFP4 checkpoints' FP8 and MXFP8 "

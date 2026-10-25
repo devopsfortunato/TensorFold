@@ -12,6 +12,7 @@ from .bf16 import b16_from_rows, quantize4, stack_b16
 from tensorfold.cuda import experts as grouped
 
 from .qmm import Q4, dequantize, make_q4, stack_q4
+from . import yarn
 from .reader import _DT, _Reader, _groups, _rows, _rows_at, norms_around_one  # noqa: F401
 from .weight_types import (
     AttnW, Config, GDNW, HC, LayerW, MoEW, MTPW, PLEW, Weights, draft_token_ids, stop_ids)  # noqa: F401 (re-exported)
@@ -40,7 +41,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
 
     model_dir = Path(model_dir)
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
-        return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
+        return yarn.apply(exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab,
+                                    table_reads=table_reads))
     full = Config.read(model_dir)
     rank, world = tp if tp is not None else (0, 1)
     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
@@ -444,4 +446,4 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     rd.release()
     torch.cuda.empty_cache()
     w.meta["load_seconds"] = time.time() - t0
-    return w
+    return yarn.apply(w)

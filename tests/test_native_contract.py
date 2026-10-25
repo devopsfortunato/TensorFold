@@ -95,6 +95,8 @@ def test_the_checker_runs_only_the_keywords_it_implements():
     ({"text_config": {"model_type": "x"}}, "unquantized"),
     ({"quantization_config": {"quant_method": "exl3", "bits": 4}}, "exl3-b4"),
     ({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}, "modelopt-nvfp4"),
+    ({"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128, "sym": True}}, "gptq-b4"),
+    ({"quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}}, "modelopt-mixed-precision"),
 ])
 def test_weight_formats_differ_wherever_the_kernels_would(config, expected):
     name = contract.weight_format(config)

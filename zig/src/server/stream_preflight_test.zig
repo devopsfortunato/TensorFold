@@ -55,6 +55,8 @@ const TestText = struct {
 
 /// An 8-token window whose engine answers "hi" at once.
 const HiEngine = struct {
+    seed: ?u64 = null, // the sampling seed of the last request
+
     fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
@@ -63,7 +65,9 @@ const HiEngine = struct {
         return .{ .context_window = 8 };
     }
 
-    fn submit(_: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
+    fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
+        const e: *HiEngine = @ptrCast(@alignCast(ctx));
+        e.seed = if (request.sampling) |s| s.seed else null;
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
         sink.event(sink.ctx, id, &.{ .tokens = &.{ 'h', 'i' } });
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
@@ -90,6 +94,8 @@ const Seen = struct {
     context_code: bool = false,
     label: ?enum { exact, greedy } = null,
     preparing: i64 = 0,
+    random_seed: bool = false, // in: the server draws a seed for a request that has none
+    seed: ?u64 = null, // out: the seed the engine was given
 
     fn out(c: *Seen) openai.Out {
         return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
@@ -145,6 +151,7 @@ fn sendTo(route: Route, body: []const u8, start: Seen) !Seen {
         .model_ids = &.{"test-model"},
         .enable_thinking = false,
         .use_drafts = false,
+        .random_seed = start.random_seed,
     }, null);
     defer srv.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -161,6 +168,7 @@ fn sendTo(route: Route, body: []const u8, start: Seen) !Seen {
     var seen = start;
     openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, chat);
     seen.preparing = srv.preparing.load(.acquire);
+    seen.seed = backend.seed;
     return seen;
 }
 
@@ -212,4 +220,26 @@ test "a reply labels a greedy request greedy and a sampled one exact" {
     const sampled = try send(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"temperature\":0.7,\"seed\":1}");
     try std.testing.expectEqual(.exact, sampled.label.?);
     try std.testing.expectEqual(@as(i64, 0), sampled.preparing);
+}
+
+const sampled_body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"temperature\":1.0}";
+
+test "a request without a seed repeats its seed by default, and draws a new one with random_seed" {
+    const a = try send(.chat, sampled_body);
+    const b = try send(.chat, sampled_body);
+    try std.testing.expect(a.seed != null);
+    try std.testing.expectEqual(a.seed, b.seed);
+    const c = try sendTo(.chat, sampled_body, .{ .random_seed = true });
+    const d = try sendTo(.chat, sampled_body, .{ .random_seed = true });
+    try std.testing.expect(c.seed != null and d.seed != null);
+    try std.testing.expect(c.seed.? != d.seed.?);
+    try std.testing.expect(c.seed.? < (@as(u64, 1) << 63));
+}
+
+test "an explicit seed wins over random_seed" {
+    const body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"temperature\":1.0,\"seed\":1234}";
+    const c = try sendTo(.chat, body, .{ .random_seed = true });
+    const d = try sendTo(.chat, body, .{ .random_seed = true });
+    try std.testing.expectEqual(@as(?u64, 1234), c.seed);
+    try std.testing.expectEqual(c.seed, d.seed);
 }

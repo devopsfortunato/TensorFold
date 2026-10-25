@@ -17,10 +17,13 @@ pub const DType = enum {
     u64,
     i64,
     f64,
+    /// FP8 (OCP): ModelOpt's NVFP4 block scales, FP8 weights and FP8 n-gram tables; e4m3 has no infinities
+    f8_e4m3,
+    f8_e5m2,
 
     pub fn size(self: DType) usize {
         return switch (self) {
-            .bool, .u8, .i8 => 1,
+            .bool, .u8, .i8, .f8_e4m3, .f8_e5m2 => 1,
             .u16, .i16, .f16, .bf16 => 2,
             .u32, .i32, .f32 => 4,
             .u64, .i64, .f64 => 8,
@@ -28,13 +31,15 @@ pub const DType = enum {
     }
 
     pub fn parse(text: []const u8) ?DType {
-        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 } };
+        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 }, .{ "F8_E4M3", .f8_e4m3 }, .{ "F8_E5M2", .f8_e5m2 } };
         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
         return null;
     }
 };
 
 pub const max_rank = 4;
+/// The highest rank a header may declare; past `max_rank` the trailing dimensions fold into the last kept one.
+pub const max_declared_rank = 8;
 
 /// A tensor's header entry: `begin` and `end` count from the data region's start (8 + the header's length).
 pub const Entry = struct {
@@ -43,6 +48,8 @@ pub const Entry = struct {
     shape: [max_rank]usize,
     begin: usize,
     end: usize,
+    /// The header's own rank when it exceeds `max_rank` (a conv weight [o, c, t, h, w] keeps [o, c, t, h * w]), else 0.
+    declared_rank: u8 = 0,
 
     pub fn dim(self: Entry, i: usize) usize {
         return if (i < self.rank) self.shape[i] else 1;
@@ -61,12 +68,14 @@ pub fn parseHeader(arena: std.mem.Allocator, json: []const u8, data_len: usize) 
         const o = kv.value_ptr.object;
         const dtype = DType.parse(o.get("dtype").?.string) orelse return error.UnsupportedDType;
         const shape = o.get("shape").?.array.items;
-        if (shape.len > max_rank) return error.RankTooHigh;
-        var e: Entry = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .begin = 0, .end = 0 };
+        if (shape.len > max_declared_rank) return error.RankTooHigh;
+        var e: Entry = .{ .dtype = dtype, .rank = @intCast(@min(shape.len, max_rank)), .shape = @splat(1), .begin = 0, .end = 0 };
+        if (shape.len > max_rank) e.declared_rank = @intCast(shape.len);
         var n: usize = dtype.size();
         for (shape, 0..) |d, i| {
-            e.shape[i] = @intCast(d.integer);
-            n *= e.shape[i];
+            const v: usize = @intCast(d.integer);
+            if (i < max_rank) e.shape[i] = v else e.shape[max_rank - 1] *= v;
+            n *= v;
         }
         const offs = o.get("data_offsets").?.array.items;
         e.begin = @intCast(offs[0].integer);
@@ -83,6 +92,8 @@ pub const Tensor = struct {
     rank: u8,
     shape: [max_rank]usize,
     bytes: []const u8,
+    /// `Entry.declared_rank`: nonzero when the header's trailing dimensions were folded
+    declared_rank: u8 = 0,
 
     pub fn dim(self: Tensor, i: usize) usize {
         return if (i < self.rank) self.shape[i] else 1;
@@ -131,7 +142,7 @@ pub const File = struct {
 
     pub fn get(self: *const File, name: []const u8) ?Tensor {
         const e = self.names.get(name) orelse return null;
-        return .{ .dtype = e.dtype, .rank = e.rank, .shape = e.shape, .bytes = self.map.memory[self.data + e.begin .. self.data + e.end] };
+        return .{ .dtype = e.dtype, .rank = e.rank, .shape = e.shape, .bytes = self.map.memory[self.data + e.begin .. self.data + e.end], .declared_rank = e.declared_rank };
     }
 };
 
@@ -146,4 +157,24 @@ test "header entries" {
     try std.testing.expectEqual(@as(usize, 2), h.count());
     try std.testing.expectEqual(DType.bf16, h.get("a.scales").?.dtype);
     try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 20));
+}
+
+test "FP8 dtypes and a rank-5 tensor (a vision patch embedding) fold into rank 4" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"w": {"dtype": "F8_E4M3", "shape": [4, 8], "data_offsets": [0, 32]},
+        \\ "v": {"dtype": "F8_E5M2", "shape": [2], "data_offsets": [32, 34]},
+        \\ "p": {"dtype": "BF16", "shape": [3, 3, 2, 4, 4], "data_offsets": [34, 610]}}
+    ;
+    const h = try parseHeader(arena.allocator(), json, 610);
+    try std.testing.expectEqual(DType.f8_e4m3, h.get("w").?.dtype);
+    try std.testing.expectEqual(@as(usize, 1), DType.f8_e4m3.size());
+    try std.testing.expectEqual(DType.f8_e5m2, h.get("v").?.dtype);
+    const p = h.get("p").?;
+    try std.testing.expectEqual(@as(u8, 4), p.rank);
+    try std.testing.expectEqual(@as(u8, 5), p.declared_rank);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 3, 2, 16 }, &p.shape);
+    try std.testing.expectEqual(@as(u8, 0), h.get("w").?.declared_rank);
+    try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 600));
 }

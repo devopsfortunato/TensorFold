@@ -37,6 +37,11 @@ pub const LaneHost = struct {
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+    round_log: bool = false, // TF_FLASHNEXT_ROUND_LOG: the engine thread's time by part, every 200 steps
+    t_step: i96 = 0,
+    t_deliver: i96 = 0,
+    t_steps: u64 = 0,
+    admit_wait_ms: u32 = 0, // an idle engine waits this long after a first arrival for requests sent together (a burst prefills in one pass)
 
     const Mark = struct { at: i96, tokens: u64 };
     const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -54,14 +59,17 @@ pub const LaneHost = struct {
         began: i96 = 0,
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+        entry_id: u64 = 0, // its id: a keep while this stream's begin waits (fair fills) may evict it
+        source: ?u64 = null, // that state's id, once its restore went through: a keep of this pass may supersede it
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+        key: []const u32 = &.{}, // what the store matches: the prompt, or a media prompt's `match`
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s);
+            if (job.host.cache) |store| _ = store.keepFrom(job.key, at, s, job.source);
         }
 
         /// The pass started from its kept state, or its copy failed (the entry goes); a pass that never got there: neither.
@@ -71,7 +79,11 @@ pub const LaneHost = struct {
             const store = job.host.cache orelse return;
             if (!job.started) return;
             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
+            if (!store.holds(e, job.entry_id)) return; // evicted before the pass began (it prefilled from 0): nothing to note
+            if (job.stream.reuse_failed) store.resumed(e, job.key, false) else if (job.stream.cached == e.at) {
+                job.source = e.id;
+                store.resumed(e, job.key, true);
+            }
         }
     };
 
@@ -81,7 +93,18 @@ pub const LaneHost = struct {
         return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
     }
 
+    /// The lane core's word that a filling prompt is in (or its fill ended): emit `prefilled`, or end the job.
+    fn filled(ptr: *anyopaque, s: *lanes.Stream, err: ?anyerror) void {
+        const h: *LaneHost = @ptrCast(@alignCast(ptr));
+        const job: *Job = @alignCast(@fieldParentPtr("stream", s));
+        const e = err orelse return h.prefilled(job, job.began); // the run loop delivers its tokens
+        if (e == error.Cancelled) {
+            _ = h.cancel(job);
+        } else _ = h.drop(job, @errorName(e));
+    }
+
     pub fn start(h: *LaneHost) !void {
+        h.core.fill_hook = .{ .ptr = h, .done = filled };
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
@@ -267,30 +290,40 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
-    fn admitOne(h: *LaneHost) bool {
+    const Prep = union(enum) { none, dropped, job: *Job };
+
+    /// Takes the next queued request into a free lane and builds its stream, not yet prefilled: `none` when none waits
+    /// or no lane is free, `dropped` when it ended here.
+    fn admitPrepare(h: *LaneHost) Prep {
         h.lock();
         if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
-            return false;
+            return .none;
         }
         const job = h.queued.orderedRemove(0);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
-            return true;
+            return .dropped;
         };
         h.unlock();
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
-        // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        // nothing keeps between here and the backend's begin, so `saved` is live there; a fair fill's begin can then
+        // wait while other prompts' keeps (or admission reclaims) free the entry: the backend resumes only the state it
+        // saw at its begin (cuda_lanes Filling.gen), else prefills from 0, and `reported` notes an entry only while the
+        // store holds it
+        // a prompt with images or video is matched by its `match` ids (each image's content hash in its placeholder
+        // rows): without them, or on an engine that cannot resume one, it is neither resumed nor kept
+        job.key = if (r.media == null) r.prompt else if (h.info_.media_reuse and r.match.len == r.prompt.len) r.match else &.{};
+        if (job.key.len > 0) if (h.cache) |store| if (store.lookup(h.gpa, job.key, r.history_len, r.shared_prefixes, r.chunks)) |l| {
             job.entry = l.entry;
+            job.entry_id = if (l.entry) |e| e.id else 0;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.droppedJob(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -305,17 +338,89 @@ pub const LaneHost = struct {
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,
             .loop_guard = r.loop_guard,
+            .call = if (r.call) |c| .{
+                .opener = c.opener,
+                .think_open = if (c.think_open) |t| t else -1,
+                .think_end = if (c.think_end) |t| t else -1,
+                .lead = c.lead,
+                .names = c.names,
+                .tail = c.tail,
+                .lex = .{ .ctx = c.lex.ctx, .blank = c.lex.blank, .text = c.lex.text, .encode = c.lex.encode },
+            } else null,
             .chunks = r.chunks,
             .reuse = reuse,
+            .media = r.media,
         }) catch {
             job.proposer.deinit();
-            return h.drop(job, "out of memory");
+            return h.droppedJob(job, "out of memory");
         };
         job.started = true;
+        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        return .{ .job = job };
+    }
+
+    fn droppedJob(h: *LaneHost, job: *Job, message: []const u8) Prep {
+        _ = h.drop(job, message);
+        return .dropped;
+    }
+
+    /// Every request waiting for a lane, admitted now: prompts that arrive together (a burst, with no resume or kept
+    /// state to take) prefill in one backend call, where the backend can (one pass over their rows).
+    fn admitAll(h: *LaneHost) void {
+        var burst: [16]*Job = undefined;
+        var n: usize = 0;
+        while (true) switch (h.admitPrepare()) {
+            .none => break,
+            .dropped => {},
+            .job => |job| {
+                if (h.loneFits(job)) {
+                    _ = h.runLone(job, job.began);
+                } else if (n < burst.len and h.core.batches() and job.stream.media == null and job.stream.reuse.at == 0 and job.stream.reuse.marks.len == 0) {
+                    burst[n] = job;
+                    n += 1;
+                } else _ = h.startOne(job);
+            },
+        };
+        h.startBurst(burst[0..n]);
+    }
+
+    /// The jobs' prompts in one backend call, then each joined and delivered in admission order; a refused burst
+    /// prefills one at a time.
+    fn startBurst(h: *LaneHost, jobs: []*Job) void {
+        if (jobs.len == 0) return;
+        if (jobs.len == 1) {
+            _ = h.startOne(jobs[0]);
+            return;
+        }
+        var ss: [16]*lanes.Stream = undefined;
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        job.began = began;
-        if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, @errorName(e));
+        for (jobs, ss[0..jobs.len]) |job, *s| {
+            job.began = began;
+            s.* = &job.stream;
+        }
+        h.core.prefillBurst(ss[0..jobs.len]) catch |e| {
+            for (jobs) |job| {
+                if (e == error.BurstRefused) _ = h.startOne(job) else if (e == error.Cancelled) _ = h.cancel(job) else _ = h.drop(job, @errorName(e));
+            }
+            return;
+        };
+        for (jobs) |job| {
+            h.core.addPrefilled(&job.stream) catch |e| {
+                _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, @errorName(e));
+                continue;
+            };
+            h.prefilled(job, began);
+            if (h.deliver(job)) h.remove(job);
+        }
+    }
+
+    /// One prepared job: its prompt prefilled alone (or its fill started), delivered.
+    fn startOne(h: *LaneHost, job: *Job) bool {
+        const began = job.began;
+        // a backend that fills prompts between rounds starts this one and admits the next (prompts that arrive
+        // together fill together); the fill hook reports it in
+        const filling = h.core.beginStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, @errorName(e));
+        if (filling) return true;
         h.prefilled(job, began);
         if (h.deliver(job)) h.remove(job);
         return true;
@@ -329,17 +434,20 @@ pub const LaneHost = struct {
         job.prefilled = done;
         h.unlock();
         job.reported();
-        if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        if (h.cache) |store| {
+            store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+            if (job.key.len > 0) store.noteServed(job.key); // text: the prompt; an image prompt: its match ids (media reuse on)
+        }
         emit(job, .{ .prefilled = job.stream.cached });
     }
 
     /// A greedy drafted request alone in the engine, with nothing waiting: the backend's own driver takes it.
     fn loneFits(h: *LaneHost, job: *Job) bool {
         const r = job.request;
-        if (h.lone == null or r.sampling != null or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+        if (h.lone == null or r.sampling != null or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.media != null) return false;
         h.lock();
         defer h.unlock();
-        return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;
+        return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0 and h.core.fillingCount() == 0;
     }
 
     /// The lone driver's rounds, its tokens sent as they land; a request arriving or a cancel hands the stream to the lane core.
@@ -418,10 +526,22 @@ pub const LaneHost = struct {
         };
     }
 
+    /// The engine is idle and a request has just arrived: requests sent together reach the queue a few ms apart, so wait
+    /// briefly (`admit_wait_ms`) and admit them as one burst instead of one prompt pass each.
+    fn gatherArrivals(h: *LaneHost) void {
+        if (h.admit_wait_ms == 0) return;
+        h.lock();
+        const lone = h.queued.items.len > 0 and h.queued.items.len < h.info_.lanes and h.admitted.items.len == 0 and h.cancels.items.len == 0 and !h.closing;
+        h.unlock();
+        if (!lone or h.core.activeCount() != 0 or h.core.fillingCount() != 0) return;
+        std.Io.sleep(h.io, .fromMilliseconds(h.admit_wait_ms), .awake) catch {};
+    }
+
     fn run(h: *LaneHost) void {
         while (true) {
             h.takeCancels();
-            while (h.admitOne()) {}
+            h.gatherArrivals();
+            h.admitAll();
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -431,16 +551,29 @@ pub const LaneHost = struct {
                 h.closeAll();
                 continue;
             }
-            if (h.core.activeCount() == 0) {
+            if (h.core.activeCount() == 0 and h.core.fillingCount() == 0) {
                 if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;
             }
             h.unlock();
+            const t0: i96 = if (h.round_log) std.Io.Clock.awake.now(h.io).toNanoseconds() else 0;
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));
                 continue;
+            };
+            const t1: i96 = if (h.round_log) std.Io.Clock.awake.now(h.io).toNanoseconds() else 0;
+            defer if (h.round_log) {
+                h.t_step += t1 - t0;
+                h.t_deliver += std.Io.Clock.awake.now(h.io).toNanoseconds() - t1;
+                h.t_steps += 1;
+                if (h.t_steps % 200 == 0) {
+                    const n: f64 = 200;
+                    std.log.info("round log: {d:.2} ms a step in the lane core, {d:.2} ms delivering tokens", .{ @as(f64, @floatFromInt(h.t_step)) / 1e6 / n, @as(f64, @floatFromInt(h.t_deliver)) / 1e6 / n });
+                    h.t_step = 0;
+                    h.t_deliver = 0;
+                }
             };
             var i: usize = 0;
             while (i < h.admitted.items.len) {

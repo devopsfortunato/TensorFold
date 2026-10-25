@@ -259,7 +259,9 @@ class FlashNextEngine:
             how = f"{'locked in memory' if locked else 'read'} in {read_s:.1f}s"
         if reread_s:
             how += f", read again after warm-up in {reread_s:.1f}s ({pinned / 2**30:.2f} GiB of pages locked)"
-        kv = "" if self.kv_dtype == "bf16" else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)"
+        kv = "" if self.kv_dtype == "bf16" else (
+            "; fp8 KV cache (e4m3, a power-of-two scale per head row)" if self.kv_dtype == "fp8"
+            else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)")
         print(f"[tensorfold] Flash Next on CUDA: {rule}; {where}{kv}; n-gram tables {how}; {captured} "
               f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
               f"prompt kernels warmed in {warm_s:.1f}s", flush=True)
@@ -267,12 +269,12 @@ class FlashNextEngine:
     def _same_settings(self, torch, ids) -> None:
         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""
 
-        from .kvcache import BITS_OF
+        from .kvcache import DTYPES
 
         total = int(ids.sum()) if ids is not None else -1
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len, self.streams,
                              int(self.graphs_enabled),
-                             len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
+                             len(ids) if ids is not None else -1, total, DTYPES.index(self.kv_dtype),
                              self.prefill_rows, int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
         both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
         self.comm.all_gather(mine, both)

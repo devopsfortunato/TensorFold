@@ -44,7 +44,8 @@ class EncodedVision:
 def vision_config(model_dir: str | Path) -> dict:
     raw = json.loads((Path(model_dir) / "config.json").read_text())
     config = raw.get("vision_config")
-    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp"):
+    # NVIDIA's Flash Next NVFP4 checkpoint names its tower ``qwen4_exp_vision`` (the same tower as qwen4_exp's)
+    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp", "qwen4_exp_vision"):
         raise ValueError("CUDA vision requires a Qwen3.5-compatible vision checkpoint")
     if config.get("deepstack_visual_indexes"):
         raise ValueError("CUDA Qwen vision does not support deepstack image features")
@@ -79,15 +80,25 @@ def _vision_sources(model_dir):
 def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
     """Validate vision tensor headers before any model or accelerator allocation."""
     from tensorfold.cuda.capacity import SIZES
+    from .qwen_checkpoint import quantized_linears, scale_tensors
     config = vision_config(model_dir)
     sources = _vision_sources(model_dir)
-    tensors = {k: value[1] for k, value in sources.items()}
+    all_tensors = {k: value[1] for k, value in sources.items()}
+    quantized = quantized_linears(all_tensors)
+    scales = scale_tensors(all_tensors, quantized)
+    tensors = {k: v for k, v in all_tensors.items() if k not in scales}
     for name, (path, info, begin) in sources.items():
         shape, offsets = info.get("shape", ()), info.get("data_offsets", ())
-        if (info.get("dtype") not in {"BF16", "F16", "F32"} or not shape
+        if name in quantized:
+            allowed = {"U8", "F8_E4M3"}
+        elif name in scales:
+            allowed = {"U8", "F8_E4M3", "F32"}
+        else:
+            allowed = {"BF16", "F16", "F32"}
+        if (info.get("dtype") not in allowed or (not shape and name not in scales)
                 or any(type(d) is not int or d <= 0 for d in shape) or len(offsets) != 2
                 or any(type(d) is not int for d in offsets) or offsets[0] < 0
-                or offsets[1] - offsets[0] != math.prod(shape) * SIZES[info["dtype"]]
+                or offsets[1] - offsets[0] != math.prod(shape) * SIZES.get(info["dtype"], 1)
                 or begin + offsets[1] > path.stat().st_size):
             raise ValueError(f"invalid or unsupported vision tensor range: {name}")
     h, mid, merged, out = (config["hidden_size"], config["intermediate_size"],
@@ -103,15 +114,17 @@ def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
             shapes[f"blocks.{layer}.{part}.bias"] = [width]
     if set(tensors) != set(shapes) | {"patch_embed.proj.weight"}:
         raise ValueError("checkpoint needs the complete unquantized Qwen vision tower; use its original MLX checkpoint")
-    if any(tensors[key]["shape"] != expected for key, expected in shapes.items()):
+    if any((quantized[key][1] if key in quantized else tensors[key]["shape"]) != expected
+           for key, expected in shapes.items()):
         raise ValueError("vision tensor shapes differ from the checkpoint configuration")
-    if any(v["dtype"] not in {"BF16", "F16", "F32"} for v in tensors.values()):
+    if any(v["dtype"] not in {"BF16", "F16", "F32"} for k, v in tensors.items() if k not in quantized):
         raise ValueError("CUDA vision requires floating-point vision weights")
     h, p, t, channels = (config[k] for k in ("hidden_size", "patch_size", "temporal_patch_size", "in_channels"))
     shape = tensors["patch_embed.proj.weight"]["shape"]
     if shape not in ([h, t, p, p, channels], [h, channels, t, p, p]):
         raise ValueError("unsupported vision patch convolution layout")
-    return config, sum(math.prod(v["shape"]) * max(2, SIZES[v["dtype"]]) for v in tensors.values())
+    return config, sum(math.prod(quantized[k][1]) * 2 if k in quantized else math.prod(v["shape"]) * max(2, SIZES[v["dtype"]])
+                       for k, v in tensors.items())
 
 
 def weight_transform(base, enabled: bool, rank: int, offload: bool = False):
@@ -123,6 +136,12 @@ def weight_transform(base, enabled: bool, rank: int, offload: bool = False):
                 return 0, 0                     # offloaded: resident in host RAM between images
             from tensorfold.cuda.capacity import SIZES
 
+            if name.endswith((".weight_scale", ".weight_scale_2")):
+                return 0, 0                  # folded into the linear's dequantized bf16 weight
+            if info["dtype"] == "U8":        # packed FP4: two values a byte, dequantized to bf16
+                return math.prod(info["shape"]) * 4, 0
+            if info["dtype"] == "F8_E4M3":   # MXFP8 weight: one byte a value, dequantized to bf16
+                return math.prod(info["shape"]) * 2, 0
             return math.prod(info["shape"]) * max(2, SIZES[info["dtype"]]), 0
         return base(name, info)
     return transform
@@ -160,7 +179,7 @@ class QwenCudaVision:
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
         from safetensors import safe_open
         from .qwen_processing import QwenImageProcessor
-        from .qwen_checkpoint import vision_key
+        from .qwen_checkpoint import dequantize_linear, is_scale_tensor, quantized_linears, vision_key
 
         self.config, self.weight_bytes = checkpoint_vision(model_dir)
         self.frontend = QwenImageProcessor.from_directory(model_dir)
@@ -175,18 +194,29 @@ class QwenCudaVision:
         config._attn_implementation = "sdpa"
         with torch.device("meta"):
             tower = Qwen3_5VisionModel(config)
-        tensors = {}
+        tensors, raw = {}, {}
         by_file = {}
-        for key, (path, info, begin) in _vision_sources(model_dir).items():
+        sources = _vision_sources(model_dir)
+        quantized = quantized_linears({k: v[1] for k, v in sources.items()})
+        for key, (path, info, begin) in sources.items():
             by_file.setdefault(path, {})[key] = info
         for path, selected in by_file.items():
             with safe_open(str(path), framework="pt", device="cpu") as source:
                 names = {vision_key(name): name for name in source.keys()}
                 for key in selected:
                     value = source.get_tensor(names[key])
+                    if key in quantized or is_scale_tensor(key):
+                        raw[key] = value.to(device=resident)
+                        continue
                     if key == "patch_embed.proj.weight" and value.shape[-1] == self.config["in_channels"]:
                         value = value.permute(0, 4, 1, 2, 3).contiguous()
                     tensors[key] = value.to(device=resident, dtype=torch.bfloat16)
+        for key, (kind, _) in quantized.items():
+            # one linear at a time: the float32 temporaries are freed before the next
+            value = dequantize_linear(kind, raw.pop(key), raw.pop(key + "_scale"), raw.pop(key + "_scale_2", None))
+            tensors[key] = value.to(torch.bfloat16)
+            del value
+        raw.clear()
         tower.load_state_dict(tensors, strict=True, assign=True)
         rotary_frequencies(tower.rotary_pos_emb, self.config, resident)
         self.tower = tower.eval()

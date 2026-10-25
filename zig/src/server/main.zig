@@ -7,6 +7,7 @@ const hub = @import("hub.zig");
 const engines = @import("engines.zig");
 const serve = @import("serve.zig");
 const hf_text = @import("hf_text.zig");
+const vision = @import("vision.zig");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] model\n";
 
@@ -40,8 +41,33 @@ pub fn main(init: std.process.Init) !u8 {
     const text = hf_text.HfText.load(gpa, io, dir, &problem) catch return fail(problem);
     defer text.deinit();
     const model_type = modelType(a, io, dir);
+    // --vision (rank 0): the helper loads and warms the tower on this GPU before the engine reads its memory
+    // budget, so the tower and the helper's context stay outside the caches' share
+    var helper: ?*vision.Helper = null;
+    defer if (helper) |h| h.stop(io);
+    if (args.vision and args.rank == 0) {
+        const env_int = struct {
+            fn of(m: *const std.process.Environ.Map, name: []const u8, default: u32) u32 {
+                const t = m.get(name) orelse return default;
+                return std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch default;
+            }
+        };
+        const settings: vision.Settings = .{
+            .allow_urls = args.vision_urls,
+            .max_images = if (args.vision_max_images) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_MAX_IMAGES", 50),
+            .max_videos = if (args.vision_max_videos) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_MAX_VIDEOS", 4),
+            .image_tokens = if (args.vision_image_tokens) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_IMAGE_TOKENS", 16384),
+        };
+        helper = vision.Helper.start(gpa, io, dir, settings, init.environ_map, &problem) catch return fail(problem);
+    }
     const opened = try engines.open(a, gpa, io, dir, model_type, args, &problem) orelse return fail(problem);
     defer opened.close(opened.ctx);
+    if (args.rank != 0) {
+        // a following rank serves no API: it runs rank 0's requests in step until rank 0 stops
+        const follow = opened.follow orelse return fail("this engine has no follower for --rank 1");
+        follow(opened.ctx) catch |e| return fail(try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ args.rank, @errorName(e) }));
+        return 0;
+    }
     return serve.run(gpa, io, args, .{
         .engine = opened.engine,
         .text = text.text(),
@@ -49,6 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
         .sampling = try sampling(a, io, dir, args),
         .environ = init.environ_map,
         .started = started,
+        .vision = helper,
     });
 }
 

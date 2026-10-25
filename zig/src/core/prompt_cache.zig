@@ -39,6 +39,14 @@ pub const Rules = struct {
     min_gap: u32 = 256,
     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
     min_prompt: u32 = 4096,
+    /// A prompt this long or longer that the store has served before (the same tokens, any earlier request) keeps a state
+    /// at its second-to-last token, so the next repeat resumes there and prefills one row. 0: off. The first sighting
+    /// pays nothing; a repeat pays one extra call once.
+    repeat_min: u32 = 0,
+    /// A pass that resumed a state and keeps one extending it frees the state it resumed (kept by an earlier, shorter
+    /// prompt, never a shared cut), instead of leaving it as an eviction candidate that still holds its storage.
+    /// Only the pass's own resume goes: a state another conversation branched from stays. One rank only.
+    supersede: bool = false,
 };
 
 pub const Entry = struct {
@@ -50,12 +58,14 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+    id: u64 = 0, // the store's count of entries made when it was made: tells it from a later entry at the same address, and
+        // names it to a pass that resumed it (keepFrom) without holding a pointer that may be freed meanwhile
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, superseded: u64 = 0, reclaimed: u64 = 0 };
 
 /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
-pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{}, source: ?u64 = null };
 
 /// The entry a backend restores itself (null: the pass starts at 0) and the pass's marks.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
@@ -67,11 +77,14 @@ pub const Store = struct {
     budget: u64,
     held: u64 = 0,
     clock: u64 = 0,
+    ids: u64 = 0, // the last entry's id
     entries: std.ArrayList(*Entry) = .empty,
     counts: Counts = .{},
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
+    seen_keys: std.ArrayList(u64) = .empty, // whole prompts served, hashed (at most SEEN_KEYS; Rules.repeat_min)
 
     const SHARED_KEYS = 64;
+    const SEEN_KEYS = 256;
 
     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
         return .{ .gpa = gpa, .family = family, .rules = rules, .budget = budget };
@@ -81,7 +94,31 @@ pub const Store = struct {
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
         s.shared_keys.deinit(s.gpa);
+        s.seen_keys.deinit(s.gpa);
         s.held = 0;
+    }
+
+    /// A served prompt is noted (after its prefill), so a repeat of it keeps a state one row short of its end.
+    pub fn noteServed(s: *Store, prompt: []const u32) void {
+        if (s.rules.repeat_min == 0 or prompt.len < s.rules.repeat_min) return;
+        const k = sharedKey(prompt);
+        if (std.mem.indexOfScalar(u64, s.seen_keys.items, k) != null) return;
+        if (s.seen_keys.items.len == SEEN_KEYS) _ = s.seen_keys.orderedRemove(0);
+        s.seen_keys.append(s.gpa, k) catch {};
+    }
+
+    /// `marks_` (owned by `a`) plus the repeat mark at the prompt's second-to-last token, when this prompt was served
+    /// before, no kept state reaches that far, and no mark sits there already.
+    fn withRepeat(s: *const Store, a: Allocator, prompt: []const u32, from: u32, marks_: []const u32) ![]const u32 {
+        if (s.rules.repeat_min == 0 or prompt.len < s.rules.repeat_min or prompt.len < 2) return marks_;
+        if (std.mem.indexOfScalar(u64, s.seen_keys.items, sharedKey(prompt)) == null) return marks_;
+        const at: u32 = @intCast(prompt.len - 1);
+        if (at <= from or at + s.rules.lookahead > prompt.len or std.mem.indexOfScalar(u32, marks_, at) != null) return marks_;
+        const out = try a.alloc(u32, marks_.len + 1);
+        @memcpy(out[0..marks_.len], marks_);
+        out[marks_.len] = at;
+        a.free(marks_);
+        return out;
     }
 
     fn free(s: *Store, e: *Entry) void {
@@ -134,16 +171,19 @@ pub const Store = struct {
             break :blk false;
         };
         const from = if (ok) e.at else 0;
+        const source: ?u64 = if (ok) e.id else null; // read now: `resumed` drops a failed entry, `reserve` may evict it
         s.resumed(e, prompt, ok);
         s.reserve(prompt, null, l.marks); // restored: the state it resumed may go too (a peer restores before it drops)
-        return .{ .from = from, .marks = l.marks };
+        return .{ .from = from, .marks = l.marks, .source = source };
     }
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
         const e = s.find(prompt, starts);
         if (e == null) s.counts.misses += 1;
-        const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
+        const from_at: u32 = if (e) |x| x.at else 0;
+        const base = try s.marks(a, prompt, from_at, history_len, shared, starts, if (e) |x| x.last else &.{});
+        const marks_ = try s.fitting(a, try s.withRepeat(a, prompt, from_at, base));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
             const at = if (s.rules.planned) floorStart(starts, w) else w;
             if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead]);
@@ -196,6 +236,13 @@ pub const Store = struct {
         return out.toOwnedSlice(a);
     }
 
+    /// Whether `e` is still the entry with `id` that a lookup returned (a keep or an admission reclaim since may have
+    /// freed it, and a new entry may sit at its address).
+    pub fn holds(s: *const Store, e: *const Entry, id: u64) bool {
+        for (s.entries.items) |x| if (x == e) return x.id == id;
+        return false;
+    }
+
     /// A looked-up entry's restore went through (it is now the prompt's), or failed (dropped: the pass ran from 0).
     pub fn resumed(s: *Store, e: *Entry, prompt: []const u32, ok: bool) void {
         const i = std.mem.indexOfScalar(*Entry, s.entries.items, e) orelse return;
@@ -241,6 +288,12 @@ pub const Store = struct {
 
     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque) bool {
+        return s.keepFrom(prompt, at, owner, null);
+    }
+
+    /// keep for a pass that resumed the entry named `source` (its id): with `supersede`, that entry goes once a state
+    /// extending it is kept.
+    pub fn keepFrom(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, source: ?u64) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
@@ -268,6 +321,9 @@ pub const Store = struct {
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
+        // the list's room first: once `save` has run, a failed append would drop the saved state, and the family's drop
+        // frees what the pass still resumes from (its tentative state, a late one included)
+        s.entries.ensureUnusedCapacity(s.gpa, 1) catch return s.fail(at, error.OutOfMemory);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
             s.gpa.destroy(e);
@@ -285,21 +341,48 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
-        s.entries.append(s.gpa, e) catch {
-            s.free(e);
-            return s.fail(at, error.OutOfMemory);
-        };
+        s.ids += 1;
+        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .id = s.ids };
+        s.entries.appendAssumeCapacity(e);
         s.held += charged;
         s.counts.kept += 1;
+        if (s.rules.supersede) if (source) |id| s.supersede(e, id);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+        return true;
+    }
+
+    /// The state the pass resumed (`source`) goes when `e` extends it: kept by a shorter prompt (an earlier turn of
+    /// this conversation), not a shared cut. Any other state `e` extends stays (another conversation may branch from it).
+    fn supersede(s: *Store, e: *const Entry, source: u64) void {
+        for (s.entries.items, 0..) |o, i| if (o.id == source) {
+            if (o != e and !o.shared and o.born < e.born and o.tokens.len < e.tokens.len and std.mem.eql(u32, e.tokens[0..o.tokens.len], o.tokens)) {
+                s.remove(i);
+                s.counts.superseded += 1;
+            }
+            return;
+        };
+    }
+
+    /// Admission is short of storage: free one kept state (a superseded one first, else the least recently used),
+    /// never the one whose storage is `skip` (the admitted prompt's resume); false when none is left to free.
+    pub fn reclaim(s: *Store, skip: ?Saved, prompt: []const u32) bool {
+        var from: ?*Entry = null;
+        if (skip) |p| for (s.entries.items) |e| if (e.saved == p) {
+            from = e;
+            break;
+        };
+        const i = s.victimBut(from, prompt) orelse return false;
+        s.remove(i);
+        s.counts.evicted += 1;
+        s.counts.reclaimed += 1;
         return true;
     }
 
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
+        // superseded and reclaimed go after the parenthesis: parsers of the line's earlier fields stay as they are
+        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d}); superseded {d}, reclaimed {d}", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed, s.counts.superseded, s.counts.reclaimed });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {

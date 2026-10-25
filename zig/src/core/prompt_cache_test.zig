@@ -112,7 +112,7 @@ const Fake = struct {
             f.sum = f.sum *% 31 +% t;
             f.at += 1;
             if (mi < plan.marks.len and plan.marks[mi] == f.at) {
-                _ = s.keep(prompt, f.at, null);
+                _ = s.keepFrom(prompt, f.at, null, plan.source); // with supersede, the state it resumed goes
                 mi += 1;
             }
         }
@@ -368,5 +368,136 @@ test "a state a peer cannot resume is forgotten: the next prompt misses instead 
     s.forget(&t2, plan.from); // the peer's answer: it lacks that state
     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
     try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t2, &.{}));
+    try std.testing.expectEqual(s.entries.items.len, f.live);
+}
+
+test "a prompt served before keeps a state one token short of its end, so its repeat prefills one row" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 4096, .repeat_min = 4 }, 1 << 20);
+    defer s.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 9, 9 };
+    var p = try s.begin(a, &prompt, 5, &.{}, &.{}, null); // first sighting: nothing extra
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+    try std.testing.expectEqual(fresh(&prompt), f.pass(&s, &prompt, p));
+    s.noteServed(&prompt);
+    p = try s.begin(a, &prompt, 5, &.{}, &.{}, null); // the repeat: a state at the second-to-last token
+    try std.testing.expectEqual(@as(u32, 0), p.from);
+    try std.testing.expectEqualSlices(u32, &.{6}, p.marks);
+    try std.testing.expectEqual(fresh(&prompt), f.pass(&s, &prompt, p));
+    p = try s.begin(a, &prompt, 5, &.{}, &.{}, null); // the third time: it resumes there and runs one row
+    try std.testing.expectEqual(@as(u32, 6), p.from);
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+    try std.testing.expectEqual(fresh(&prompt), f.pass(&s, &prompt, p));
+    const other = [_]u32{ 1, 2, 3 }; // under repeat_min: never marked
+    s.noteServed(&other);
+    p = try s.begin(a, &other, 0, &.{}, &.{}, null);
+    try std.testing.expectEqualSlices(u32, &.{}, p.marks);
+}
+
+test "supersede: a conversation holds one state, its newest; a shared cut and the pass's own earlier mark stay" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0, .min_gap = 4, .supersede = true }, 1 << 20);
+    defer s.deinit();
+    var conv: [80]u32 = undefined;
+    for (&conv, 1..) |*t, i| t.* = @intCast(i); // a 10-token shared system block, then the turns (each resumes
+    // the last one's history, 2 tokens before its end: the stable prefix is within min_gap of it, so one mark a turn)
+    var other: [30]u32 = @splat(7); // another conversation: never a prefix of this one
+    _ = f.pass(&s, &other, try s.begin(a, &other, 28, &.{}, &.{}, null));
+    var len: u32 = 20;
+    var turns: u64 = 0;
+    while (len <= 80) : (len += 15) {
+        const plan = try s.begin(a, conv[0..len], len - 2, &.{10}, &.{}, null);
+        if (turns > 0) try std.testing.expectEqual(len - 15 - 2, plan.from); // the last turn's history state
+        try std.testing.expectEqual(fresh(conv[0..len]), f.pass(&s, conv[0..len], plan));
+        turns += 1;
+        // the other conversation, the shared cut at 10 and this conversation's newest state: nothing else
+        try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
+        try std.testing.expectEqual(len - 2, s.find(conv[0..len], &.{}).?.at);
+        try std.testing.expectEqual(@as(u32, 10), s.find(conv[0..12], &.{}).?.at);
+        try std.testing.expect(s.find(&other, &.{}) != null);
+    }
+    try std.testing.expectEqual(turns - 1, s.counts.superseded);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
+    try std.testing.expectEqual(s.entries.items.len, f.live);
+    // one pass's two marks (a stable prefix and its history) both stay: neither was born before the other
+    var two: [100]u32 = @splat(3);
+    f.at = 40;
+    try std.testing.expect(s.keep(&two, 40, null));
+    f.at = 90;
+    try std.testing.expect(s.keep(&two, 90, null));
+    try std.testing.expectEqual(@as(u32, 40), s.find(two[0..60], &.{}).?.at);
+    try std.testing.expectEqual(@as(u32, 90), s.find(&two, &.{}).?.at);
+    try std.testing.expectEqual(turns - 1, s.counts.superseded);
+    try std.testing.expectEqual(s.entries.items.len, f.live);
+}
+
+test "supersede frees only the state the pass itself resumed: a branch that did not resume it leaves it for others" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .min_gap = 4, .supersede = true }, 1 << 20);
+    defer s.deinit();
+    var conv: [40]u32 = undefined;
+    for (&conv, 1..) |*t, i| t.* = @intCast(i);
+    _ = f.pass(&s, conv[0..20], try s.begin(a, conv[0..20], 18, &.{}, &.{}, null)); // S at 18
+    // a second request of the same conversation that started from 0 (the lookup missed: S not kept yet, say)
+    var p = try s.begin(a, conv[0..30], 28, &.{}, &.{}, null);
+    p.from = 0;
+    p.source = null;
+    p.marks = &.{28};
+    _ = f.pass(&s, conv[0..30], p);
+    try std.testing.expectEqual(@as(u32, 18), s.find(conv[0..20], &.{}).?.at); // S stays: this pass did not resume it
+    try std.testing.expectEqual(@as(u64, 0), s.counts.superseded);
+    // a regenerate branching from S (resumes it, keeps its own continuation) frees it: it was this pass's source
+    var branch: [30]u32 = undefined;
+    @memcpy(branch[0..20], conv[0..20]);
+    for (branch[20..], 0..) |*t, i| t.* = @intCast(500 + i);
+    const q = try s.begin(a, &branch, 28, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 18), q.from);
+    try std.testing.expectEqual(fresh(&branch), f.pass(&s, &branch, q));
+    try std.testing.expectEqual(@as(u64, 1), s.counts.superseded);
+    try std.testing.expect(s.find(conv[0..20], &.{}) == null);
+    try std.testing.expectEqual(@as(u32, 28), s.find(conv[0..30], &.{}).?.at); // the other request's state stays
+    try std.testing.expectEqual(s.entries.items.len, f.live);
+}
+
+test "reclaim frees a superseded state first, then the least recently used, never the admitted prompt's resume" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20); // supersede off: the old turn stays
+    defer s.deinit();
+    const c1 = [_]u32{ 5, 5, 5, 5, 5, 5 };
+    _ = f.pass(&s, &c1, try s.begin(a, &c1, 4, &.{}, &.{}, null));
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    _ = f.pass(&s, &t2, try s.begin(a, &t2, 6, &.{}, &.{}, null));
+    try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
+    const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const resume_ = s.find(&t3, &.{}).?; // t2's state at 6
+    try std.testing.expect(s.reclaim(resume_.saved, &t3)); // t1's state at 4: t2's extends it
+    try std.testing.expect(s.find(&t1, &.{}) == null);
+    try std.testing.expect(s.find(&c1, &.{}) != null);
+    try std.testing.expect(s.reclaim(resume_.saved, &t3)); // then the least recently used: c1's
+    try std.testing.expect(s.find(&c1, &.{}) == null);
+    try std.testing.expect(!s.reclaim(resume_.saved, &t3)); // only the resume is left
+    try std.testing.expectEqual(@as(u32, 6), s.find(&t3, &.{}).?.at);
+    try std.testing.expectEqual(@as(u64, 2), s.counts.reclaimed);
+    try std.testing.expectEqual(@as(u64, 2), s.counts.evicted);
+    try std.testing.expect(s.reclaim(null, &t3)); // without a resume to spare, it goes too
+    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
     try std.testing.expectEqual(s.entries.items.len, f.live);
 }

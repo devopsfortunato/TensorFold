@@ -25,6 +25,7 @@ pub const Engine = engine.Engine;
 pub const Config = config.Config;
 pub const Model = config.Model;
 pub const Stream = stream.Stream;
+pub const Media = stream.Media;
 pub const Sampling = sampling.Sampling;
 pub const SuffixLookup = proposer.SuffixLookup;
 

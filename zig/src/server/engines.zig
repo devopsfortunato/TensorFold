@@ -23,5 +23,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
         .speed_up = args.speed_up,
         .prompt_cache_gib = args.prompt_cache_gib,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
+        .tp = args.tp,
+        .rank = args.rank,
+        .master = args.master,
+        .master_port = args.master_port,
+        .vision = args.vision,
+        .kv_dtype = args.kv_dtype,
     }, problem);
 }

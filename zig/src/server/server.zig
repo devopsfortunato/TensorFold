@@ -36,6 +36,8 @@ pub const Config = struct {
     default_sampling: ?Value = null,
     use_drafts: bool = true,
     seed_salt: i64 = 0,
+    /// TENSORFOLD_RANDOM_SEED=1: a request without a seed draws a random one, as OpenAI's API does (default: keyed to the prompt).
+    random_seed: bool = false,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
@@ -64,6 +66,9 @@ pub const Server = struct {
     open_connections: std.atomic.Value(u32) = .init(0),
     preparing: std.atomic.Value(i64) = .init(0),
     arena: std.heap.ArenaAllocator,
+    /// --vision: the helper that prepares image and video prompts (null: text only)
+    vision: ?*@import("vision.zig").Helper = null,
+    media_limits: @import("messages.zig").MediaLimits = .{},
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
@@ -100,6 +105,13 @@ pub const Server = struct {
         return fields.coerceEffort(e, srv.effort_levels);
     }
 
+    /// A fresh 63-bit seed, the width ``seedFor`` gives.
+    fn randomSeed(srv: *const Server) u64 {
+        var bytes: [8]u8 = undefined;
+        srv.io.random(&bytes);
+        return std.mem.readInt(u64, &bytes, .little) & ((@as(u64, 1) << 63) - 1);
+    }
+
     /// ``_resolve_sampling``: omitted or null fields keep the defaults; an omitted seed is keyed to the prompt.
     pub fn resolveSampling(srv: *Server, cx: *Cx, f: Value, temperature: f64, prompt_ids: []const u32) errors.Refused!?api.Sampling {
         _ = temperature; // the request's own temperature field decides, as in the Python server
@@ -108,7 +120,7 @@ pub const Server = struct {
         try merge(options, cx, try fields.parseNumbers(cx, f));
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
-        const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
+        const seed: u64 = if (options.get("seed")) |s| seedBits(s) else if (srv.config.random_seed) srv.randomSeed() else api.seedFor(prompt_ids, srv.config.seed_salt);
         return .{
             .seed = seed,
             .temperature = @floatCast(temp),
@@ -136,12 +148,39 @@ pub const Server = struct {
                 };
                 break :blk if (ids.len > 0) ids[0] else null;
             } else srv.text.tokenId("<think>");
-            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close) };
+            request.call = .{
+                .opener = opener.?,
+                .lead = form.?.lead orelse "",
+                .tail = form.?.tail orelse "",
+                .names = names.items,
+                .think_open = think_open,
+                .think_end = srv.text.tokenId(srv.markers.close),
+                .lex = .{ .ctx = srv, .blank = callBlank, .text = callText, .encode = callEncode },
+            };
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
         }
+    }
+
+    fn callBlank(ctx: *anyopaque, token: u32) bool {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        for (srv.text.eosIds()) |e| if (e == token) return false;
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const text = srv.text.decode(fba.allocator(), &.{token}) catch return false;
+        return std.mem.trim(u8, text, " \t\r\n").len == 0;
+    }
+
+    fn callText(ctx: *anyopaque, a: std.mem.Allocator, token: u32) anyerror![]const u8 {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        return srv.text.decode(a, &.{token});
+    }
+
+    fn callEncode(ctx: *anyopaque, a: std.mem.Allocator, text: []const u8) anyerror![]const u32 {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        return srv.text.encode(a, text, false);
     }
 
     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };

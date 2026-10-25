@@ -16,7 +16,7 @@ from tensorfold.cuda.kernels import gdn as shared_gdn
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
-from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm
+from . import attn_multi, bf16, gdn_io, gdn_multi, glue, kv8, nvfp4_moe, qmm
 from . import image_rows
 from .hc_check import fuser as _hc_fuser
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
@@ -227,7 +227,7 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
     sections = getattr(c, "mrope_section", (11, 11, 10))
     step = None if b.prefill else getattr(b, "attn_step", None)     # a concurrent step: every stream at once
     if step is not None:
-        o = attn_multi.layer(layer, w, b, step, mtp, scale)
+        o = kv8.multi_layer(layer, w, b, step, mtp, scale)
         glue.attn_gate(o[:R], b.pa[:R], b.gated[:R], b.xs_gated[:R], q_heads=c.heads, head_dim=c.head_dim)
         return _out_proj(w, b, b.gated[:R], a.o, b.xs_gated[:R], R)
     for st, a0, a1 in segs:
@@ -237,10 +237,10 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
         rope = st.image_positions
         length = 0 if rope is None else rope.shape[0]
         delta = st.rope_delta_dev if rope is not None or st.rope_delta else None
-        glue.attn_prep(b.pa[a0:a1], pos, a.q_scale, a.k_scale, a.iq_scale, w.inv_freq, b.q[a0:], cache.k, cache.v,
-                       b.iq[a0:], ikc, c.eps, q_heads=c.heads, kv_heads=c.kv_heads, head_dim=c.head_dim,
-                       index_heads=c.index_heads, index_dim=c.index_dim, ks=cache.ks, vs=cache.vs, bits=bits,
-                       rope=rope, delta=delta, length=length, sections=sections)
+        kv8.attn_prep(b.pa[a0:a1], pos, a.q_scale, a.k_scale, a.iq_scale, w.inv_freq, b.q[a0:], cache.k, cache.v,
+                      b.iq[a0:], ikc, c.eps, q_heads=c.heads, kv_heads=c.kv_heads, head_dim=c.head_dim,
+                      index_heads=c.index_heads, index_dim=c.index_dim, ks=cache.ks, vs=cache.vs, bits=bits,
+                      rope=rope, delta=delta, length=length, sections=sections)
         if b.prefill:
             if b.attn.qsa:
                 attn_mod.qsa_pool(ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0, rope=rope,
@@ -251,13 +251,13 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
                 ends = host_pos + r0 - a0 + n
                 if b.attn.qsa:
                     attn_mod.qsa_rows(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n, context=ends)
-                attn_mod.attention(b.q[r0:r0 + n], cache.k, cache.v, b.pos_blk, b.attn, n, scale,
+                kv8.attention(b.q[r0:r0 + n], cache.k, cache.v, b.pos_blk, b.attn, n, scale,
                                    out=b.attn_o[r0:r0 + n], context=ends, ks=cache.ks, vs=cache.vs, bits=bits)
             continue
         if b.attn.qsa:
             attn_mod.qsa_select(b.iq[a0:a1], ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0,
                                 context=keys, rope=rope, delta=delta, length=length, sections=sections)
-        o = attn_mod.attention(b.q[a0:a1], cache.k, cache.v, pos, b.attn, a1 - a0, scale, context=keys,
+        o = kv8.attention(b.q[a0:a1], cache.k, cache.v, pos, b.attn, a1 - a0, scale, context=keys,
                                ks=cache.ks, vs=cache.vs, bits=bits)
         if len(segs) > 1:                       # the scratch output is the next stream's too
             b.attn_o[a0:a1].copy_(o[:a1 - a0])

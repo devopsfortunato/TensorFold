@@ -16,7 +16,7 @@ pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
     }
     const index = try std.fs.path.join(gpa, &.{ dir, "model.safetensors.index.json" });
     defer gpa.free(index);
-    if (Io.Dir.cwd().readFileAlloc(io, index, gpa, .limited(1 << 26))) |text| {
+    if (Io.Dir.cwd().readFileAlloc(io, index, gpa, .limited(1 << 29))) |text| {
         defer gpa.free(text);
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
         defer parsed.deinit();

@@ -5,10 +5,11 @@ const cuda = @import("cuda");
 const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
+const flashnext = @import("flashnext");
 const Allocator = std.mem.Allocator;
 
 /// The CUDA families: namespaces with `model_type`, `formats`, `default_context`, `prefill_step` and `open`.
-const registry = .{nemotron.native};
+const registry = .{ nemotron.native, flashnext.native };
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
@@ -65,12 +66,16 @@ const Host = struct {
     ctx: cuda.Context,
     family: *anyopaque,
     release: *const fn (*anyopaque) void,
+    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // a following rank's loop (two-rank families)
     inner: lanes.backend.Backend,
     vtable: lanes.backend.Backend.VTable,
     cfg: lanes.Config,
     clock: lanes.backend.WallClock,
     core: lanes.Engine,
     host: api.LaneHost,
+    /// kept prompt states, for families whose backend keeps them (Loaded.cache)
+    store: ?api.prompt_cache.Store = null,
+    store_vt: api.prompt_cache.Snapshots.VTable = undefined,
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -78,10 +83,28 @@ const Host = struct {
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         h.ctx.makeCurrent() catch {};
+        if (h.store) |*st| st.deinit(); // its states go back to the family before the family goes
         h.release(h.family);
         h.ctx.deinit();
         h.driver.close();
         h.gpa.destroy(h);
+    }
+
+    /// A TF_FLASHNEXT_* switch that is on unless set to 0.
+    fn on(name: [*:0]const u8) bool {
+        const v = std.c.getenv(name) orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
+    /// The store's admission eviction for the family (cuda_lanes Reclaim), on the engine thread like every store call.
+    fn reclaim(p: *anyopaque, skip: ?*anyopaque, prompt: []const u32) bool {
+        const st: *api.prompt_cache.Store = @ptrCast(@alignCast(p));
+        return st.reclaim(skip, prompt);
+    }
+
+    fn follow(p: *anyopaque) anyerror!void {
+        const h: *Host = @ptrCast(@alignCast(p));
+        return h.follow_fn.?(h.family);
     }
 
     fn bind(p: *anyopaque) *Host {
@@ -169,10 +192,35 @@ const Host = struct {
                     x.inner.vtable.release(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_begin = if (v.prefill_begin != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_begin.?(x.inner.ptr, s);
+                }
+            }.f else null,
+            .prefill_step = if (v.prefill_step != null) struct {
+                fn f(p: *anyopaque, ss: []const *lanes.Stream, states: []lanes.backend.FillState) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_step.?(x.inner.ptr, ss, states);
+                }
+            }.f else null,
+            .prefill_many = if (v.prefill_many != null) struct {
+                fn f(p: *anyopaque, ss: []const *lanes.Stream) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_many.?(x.inner.ptr, ss);
+                }
+            }.f else null,
         };
         return .{ .ptr = h, .vtable = &h.vtable };
     }
 };
+
+/// `text` as family F's KV cache format (its Options.kv_dtype), or null when F does not serve it; a family without
+/// the option serves "bf16" only.
+fn kvDtype(comptime F: type, text: []const u8) ?(if (@hasField(F.Options, "kv_dtype")) @FieldType(F.Options, "kv_dtype") else void) {
+    if (@hasField(F.Options, "kv_dtype")) return std.meta.stringToEnum(@FieldType(F.Options, "kv_dtype"), text);
+    return if (std.mem.eql(u8, text, "bf16")) {} else null;
+}
 
 /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
@@ -184,17 +232,24 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
 }
 
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
-    const native = modelContext(a, io, o.dir);
+    // a family may serve past config.json's window (Flash Next with YaRN): its modelWindow says how far
+    const native = if (@hasDecl(F, "modelWindow")) F.modelWindow(a, io, o.dir) else modelContext(a, io, o.dir);
     const window: i64 = o.context orelse @min(F.default_context, if (native > 0) native else F.default_context);
     if (window <= 0 or (native > 0 and window > native)) {
         problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ window, native });
         return null;
     }
+    // the KV cache's format: a family whose options name it serves its formats; the others serve bf16 only
+    const kv = kvDtype(F, o.kv_dtype) orelse {
+        problem.* = try std.fmt.allocPrint(a, "--kv-dtype {s}: the native CUDA engine serves {s} with a bf16 KV cache; serve with --engine python", .{ o.kv_dtype, o.model_type });
+        return null;
+    };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.gpa = gpa;
     h.driver = cuda.Driver.open() catch |e| {
         problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
+        gpa.destroy(h); // a null return runs no errdefer
         return null;
     };
     errdefer h.driver.close();
@@ -202,12 +257,39 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     errdefer h.ctx.deinit();
     bound = &h.ctx;
     const kernels = try kernelDir(a, io, try h.ctx.capability());
-    const loaded = F.open(gpa, io, &h.ctx, o.dir, kernels, .{ .context = @intCast(window), .drafts = o.drafts }) catch |e| {
+    // two ranks only for families whose options take them
+    const two_rank = @hasField(F.Options, "tp");
+    if (o.tp > 1 and !two_rank) {
+        problem.* = try std.fmt.allocPrint(a, "--tp {d}: the native CUDA engine serves {s} on one GPU only", .{ o.tp, o.model_type });
+        h.ctx.deinit();
+        h.driver.close();
+        gpa.destroy(h);
+        return null;
+    }
+    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts };
+    if (@hasField(F.Options, "kv_dtype")) fo.kv_dtype = kv;
+    // a family whose backend shares forwards between streams sizes them by --parallel
+    if (@hasField(F.Options, "parallel")) fo.parallel = o.lanes;
+    if (@hasField(F.Options, "prompt_cache_gib")) fo.prompt_cache_gib = o.prompt_cache_gib;
+    if (@hasField(F.Options, "vision")) fo.vision = o.vision;
+    if (two_rank) {
+        fo.tp = o.tp;
+        fo.rank = o.rank;
+        fo.master = o.master;
+        fo.master_port = o.master_port;
+    }
+    const loaded = F.open(gpa, io, &h.ctx, o.dir, kernels, fo) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
+        // a null return runs no errdefer: the host, its context and driver go here (they leaked before)
+        bound = null;
+        h.ctx.deinit();
+        h.driver.close();
+        gpa.destroy(h);
         return null;
     };
     h.family = loaded.ctx;
     h.release = loaded.deinit;
+    h.follow_fn = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
     errdefer h.release(h.family);
     h.inner = loaded.backend;
     h.cfg = try lanes.Config.init(gpa, loaded.facts, loaded.rows, loaded.rows - 1);
@@ -215,9 +297,36 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media, .media_reuse = @hasDecl(F, "media") and F.media and o.tp <= 1 and mediaReuseOn() });
+    h.store = null;
+    if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
+        // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
+        h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
+        var rules: api.prompt_cache.Rules = if (@hasDecl(F, "cache_rules")) .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned, .repeat_min = if ((if (std.c.getenv("TF_FLASHNEXT_REPEAT_CACHE")) |v| v[0] == 0x30 else false)) 0 else if (@hasField(@TypeOf(F.cache_rules), "repeat_min")) F.cache_rules.repeat_min else 0 } else .{};
+        // one rank only (a two-rank peer hears of drops with the next request): a pass that resumed a state frees it
+        // once it keeps a state extending it (TF_FLASHNEXT_SUPERSEDE=0: off); admission frees kept states before it
+        // refuses a prompt that can fit (TF_FLASHNEXT_ADMIT_RECLAIM=0: off, read by the family too)
+        const one_rank = o.tp <= 1;
+        rules.supersede = one_rank and Host.on("TF_FLASHNEXT_SUPERSEDE");
+        h.store = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, rules, c.budget);
+        h.host.cache = &h.store.?;
+        var reclaim_ = false;
+        if (comptime @hasField(@TypeOf(c), "set_reclaim")) if (c.set_reclaim) |set| if (one_rank and Host.on("TF_FLASHNEXT_ADMIT_RECLAIM")) {
+            set(c.ptr, .{ .ptr = &h.store.?, .evict = Host.reclaim });
+            reclaim_ = true;
+        };
+        std.log.info("prompt cache: supersede {s}, admission reclaim {s}", .{ if (rules.supersede) "on" else "off", if (reclaim_) "on" else "off" });
+    };
+    h.host.round_log = std.c.getenv("TF_FLASHNEXT_ROUND_LOG") != null;
+    h.host.admit_wait_ms = if (std.c.getenv("TF_FLASHNEXT_ADMIT_WAIT_MS")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 3 else 3;
     try h.host.start();
-    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = if (h.follow_fn != null) Host.follow else null };
+}
+
+/// TF_FLASHNEXT_MEDIA_REUSE=0: media prompts are neither resumed nor kept (the upstream rule).
+fn mediaReuseOn() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_MEDIA_REUSE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
 test "chip classes name the compute capability" {
@@ -230,4 +339,5 @@ test "chip classes name the compute capability" {
 test "every registered family is listed for capabilities" {
     try std.testing.expectEqual(@as(usize, registry.len), families.len);
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
+    try std.testing.expectEqualStrings("qwen4_exp", families[1].model_type);
 }

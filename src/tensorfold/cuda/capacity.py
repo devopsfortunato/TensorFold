@@ -337,7 +337,9 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
                 raise ValueError(f"host staging needs an estimated {host_staging / GIB:.2f} GiB, "
                                  f"but only {host_free / GIB:.2f} GiB is available after its reserve; "
                                  "free host memory or use a checkpoint with smaller loading buffers")
-        plan = make_plan(int(text.get("max_position_embeddings") or 0), requested,
+        from tensorfold.families.qwen4_exp.cuda.yarn import window
+
+        plan = make_plan(window(text, int(text.get("max_position_embeddings") or 0)), requested,
                          requested is not None if explicit is None else explicit,
                          available_bytes(torch), weights, geometry, room=page_room(torch))
     except (OSError, ValueError, KeyError, TypeError, struct.error) as exc:
