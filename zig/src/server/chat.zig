@@ -203,6 +203,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     const a = cx.a;
     const io = srv.io;
     var request = prepared.request;
+    defer freeStructure(&request); // declared before submit: runs after the errdefer below waits for ``finished``
     const input = prepared.input;
     const received = prepared.received;
     const thinking = prepared.thinking;
@@ -263,6 +264,12 @@ pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Fail
 /// Give back a foreground request's preparing count: at its submit, or when it is never generated.
 pub fn release(srv: *Server, preparing: bool) void {
     if (preparing) _ = srv.preparing.fetchSub(1, .acq_rel);
+}
+
+/// Frees the grammar prepare compiled (checkFeatures), once the engine has finished with the request or it was never
+/// submitted; the reply's matcher keeps its own reference.
+pub fn freeStructure(request: *const api.Request) void {
+    if (request.structure) |st| if (st.compiled) |g| g.free();
 }
 
 /// The text a stream has sent: Python's ``streamed = visible``, grown by its delta while it only grows.

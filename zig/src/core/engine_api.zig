@@ -47,8 +47,9 @@ pub const Structure = struct {
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
-    /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
-    compiler: ?*grammar.Compiler = null,
+    /// `text` as the server compiled it, freed by the server after ``finished``: the engine makes the reply's
+    /// matcher from it and never compiles.
+    compiled: ?grammar.Compiled = null,
 };
 
 pub const grammar = lanes.grammar;

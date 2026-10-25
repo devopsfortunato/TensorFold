@@ -167,12 +167,18 @@ pub const Server = struct {
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
+            try grammar.bounded(cx, s);
             const c = srv.grammarCompiler() orelse return cx.fail(.request, "structured output: {s}", .{srv.grammar_problem.?});
             var err: [512]u8 = undefined;
-            const compiled = c.compile(srv.io, @enumFromInt(@intFromEnum(s.kind)), s.text, &err) catch
-                return cx.fail(.request, "{s}: the grammar cannot be enforced: {s}", .{ s.field, std.mem.sliceTo(&err, 0) });
-            compiled.free(); // kept in the compiler's cache for the engine's compile
-            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiler = c };
+            const limits: api.grammar.Compiler.Limits = .{};
+            // compiled here, on the request's thread, and only here: the engine makes the reply's matcher from it
+            const compiled = c.compileWithin(srv.gpa, srv.io, @enumFromInt(@intFromEnum(s.kind)), s.text, limits, &err) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.GrammarBusy => cx.fail(.capacity, "structured output: {d} grammars are compiling now; retry shortly", .{limits.running}),
+                error.GrammarTimeout => cx.fail(.request, "{s}: the grammar did not compile within {d} s", .{ s.field, limits.timeout_ms / 1000 }),
+                else => cx.fail(.request, "{s}: the grammar cannot be enforced: {s}", .{ s.field, std.mem.sliceTo(&err, 0) }),
+            };
+            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiled = compiled };
         }
     }
 

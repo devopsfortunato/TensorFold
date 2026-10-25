@@ -9,8 +9,11 @@ pub const pinned = "v0.2.8";
 
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const step = b.step("grammar", "libtfgrammar (structured output) from an xgrammar " ++ pinned ++ " checkout: -Dxgrammar=DIR");
-    const dir = b.option([]const u8, "xgrammar", "An xgrammar " ++ pinned ++ " checkout with its submodules, for `zig build grammar`") orelse {
-        step.dependOn(&b.addFail("zig build grammar needs -Dxgrammar=DIR: git clone --branch " ++ pinned ++ " --recurse-submodules https://github.com/mlc-ai/xgrammar").step);
+    const test_step = b.step("grammar-test", "libtfgrammar's C ABI through lanes/grammar.zig (zig/src/grammar/tf_grammar_test.zig): -Dxgrammar=DIR");
+    const dir = b.option([]const u8, "xgrammar", "An xgrammar " ++ pinned ++ " checkout with 3rdparty/picojson and 3rdparty/dlpack, for `zig build grammar`") orelse {
+        const fail = b.addFail("zig build grammar needs -Dxgrammar=DIR: git clone --branch " ++ pinned ++ " https://github.com/mlc-ai/xgrammar, then git submodule update --init 3rdparty/dlpack (picojson is in the tree)");
+        step.dependOn(&fail.step);
+        test_step.dependOn(&fail.step);
         return;
     };
     const root: std.Build.LazyPath = .{ .cwd_relative = dir };
@@ -22,7 +25,15 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget) void {
     mod.addCSourceFiles(.{ .root = root, .files = sources(b, dir), .flags = &flags });
     mod.addCSourceFile(.{ .file = b.path("zig/src/grammar/tf_grammar.cc"), .flags = &flags });
     const lib = b.addLibrary(.{ .name = "tfgrammar", .linkage = .dynamic, .root_module = mod });
-    step.dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "native/lib" } } }).step);
+    const install = b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "native/lib" } } });
+    step.dependOn(&install.step);
+    // the FFI's tests load the library just installed, as the server does (dlopen of libtfgrammar.so)
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/grammar/tf_grammar_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} }) });
+    const run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=\"$0\" exec \"$1\"" });
+    run.addDirectoryArg(lib.getEmittedBinDirectory());
+    run.addArtifactArg(tests);
+    test_step.dependOn(&run.step);
 }
 
 /// xgrammar's library sources as its CMakeLists globs them: cpp/**/*.cc without the Python bindings (cpp/tvm_ffi).

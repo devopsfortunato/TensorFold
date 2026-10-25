@@ -55,12 +55,16 @@ pub const library = if (builtin.os.tag == .macos) "libtfgrammar.dylib" else "lib
 
 pub const Kind = enum(u8) { json, json_schema, regex, choice, grammar };
 
-/// One tokenizer's grammar compiler; compiled grammars are cached by their text (xgrammar's cache).
+/// Compiles running now on compileWithin's threads, those a request stopped waiting for included (per process: a
+/// thread past its request may outlive the server that started it).
+pub var running: std.atomic.Value(u32) = .init(0);
+
+/// One tokenizer's grammar compiler; compiled grammars are cached by their text (xgrammar's cache). xgrammar's
+/// compiler and its cache are thread-safe, so requests compile on their own threads at once, with no lock here.
 pub const Compiler = struct {
     f: Fns,
     h: *anyopaque,
     words: usize,
-    mutex: std.Io.Mutex = .init,
 
     /// `tokenizer_json`: tokenizer.json's text; `vocab`: the logits' width; `stops`: the model's eos ids.
     pub fn open(tokenizer_json: []const u8, vocab: u32, stops: []const u32, err: *[512]u8) !Compiler {
@@ -70,35 +74,95 @@ pub const Compiler = struct {
         return .{ .f = f, .h = h, .words = @intCast(f.words(h)) };
     }
 
+    /// Closes the compiler, unless a compile a request gave up on still runs on it (the process is exiting then).
     pub fn close(c: *Compiler) void {
-        c.f.close(c.h);
+        if (running.load(.acquire) == 0) c.f.close(c.h);
     }
 
-    /// The compiled grammar, or error.Grammar with xgrammar's words in `err` (requests compile on their own threads).
-    pub fn compile(c: *Compiler, io: std.Io, kind: Kind, text: []const u8, err: *[512]u8) !Compiled {
+    /// The compiled grammar, or error.Grammar with xgrammar's words in `err`, on the caller's thread.
+    pub fn compile(c: *const Compiler, kind: Kind, text: []const u8, err: *[512]u8) !Compiled {
         err[0] = 0;
-        c.mutex.lockUncancelable(io);
-        defer c.mutex.unlock(io);
         const g = c.f.compile(c.h, @intFromEnum(kind), text.ptr, text.len, err, err.len) orelse return error.Grammar;
-        return .{ .f = c.f, .h = g };
+        return .{ .f = c.f, .h = g, .words = c.words };
     }
 
-    /// A fresh reply's grammar over `text`, starting after `after` when thinking is on.
-    pub fn constraint(c: *Compiler, gpa: Allocator, io: std.Io, kind: Kind, text: []const u8, after: ?u32) !*Constraint {
-        var err: [512]u8 = undefined;
-        const g = try c.compile(io, kind, text, &err);
-        defer g.free();
-        const m = try g.matcher();
-        errdefer m.free();
-        const out = try gpa.create(Constraint);
-        out.* = .init(m.rules(), c.words, after);
-        return out;
+    pub const Limits = struct {
+        /// the longest a request waits for its compile; past it the request is refused and the compile ends alone
+        timeout_ms: u32 = 10_000,
+        /// compiles at once, those past their timeout included; one more is refused (error.GrammarBusy)
+        running: u32 = 4,
+    };
+
+    /// `compile` on a thread of its own, waited for at most `limits.timeout_ms` (xgrammar cannot stop a compile):
+    /// error.GrammarTimeout past it, and the thread frees what it compiles; error.GrammarBusy when `limits.running`
+    /// compiles run already, so grammars that never finish cannot pile up threads.
+    pub fn compileWithin(c: *const Compiler, gpa: Allocator, io: std.Io, kind: Kind, text: []const u8, limits: Limits, err: *[512]u8) !Compiled {
+        err[0] = 0;
+        if (running.fetchAdd(1, .acq_rel) >= limits.running) {
+            _ = running.fetchSub(1, .acq_rel);
+            return error.GrammarBusy;
+        }
+        const job = gpa.create(Job) catch {
+            _ = running.fetchSub(1, .acq_rel);
+            return error.OutOfMemory;
+        };
+        job.* = .{ .c = c.*, .gpa = gpa, .kind = kind, .text = gpa.dupe(u8, text) catch {
+            gpa.destroy(job);
+            _ = running.fetchSub(1, .acq_rel);
+            return error.OutOfMemory;
+        } };
+        const thread = std.Thread.spawn(.{}, Job.run, .{ job, io }) catch {
+            gpa.free(job.text);
+            gpa.destroy(job);
+            _ = running.fetchSub(1, .acq_rel);
+            return error.GrammarBusy;
+        };
+        thread.detach();
+        job.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(limits.timeout_ms), .clock = .awake } }) catch {
+            job.release(); // the thread frees the job and its grammar when the compile ends
+            return error.GrammarTimeout;
+        };
+        defer job.release();
+        err.* = job.err;
+        const g = job.result orelse return error.Grammar;
+        job.result = null;
+        return g;
     }
+
+    /// One compileWithin: held by the waiting request and by the compile's thread, freed by the last to let go. It
+    /// keeps its own copy of the compiler's handles, so the thread reads nothing of the server's.
+    const Job = struct {
+        c: Compiler,
+        gpa: Allocator,
+        kind: Kind,
+        text: []u8,
+        err: [512]u8 = @splat(0),
+        result: ?Compiled = null,
+        done: std.Io.Event = .unset,
+        refs: std.atomic.Value(u8) = .init(2),
+
+        fn run(j: *Job, io: std.Io) void {
+            j.result = j.c.compile(j.kind, j.text, &j.err) catch null;
+            j.done.set(io);
+            j.release();
+            _ = running.fetchSub(1, .acq_rel); // last: the compiler may close once nothing runs on it
+        }
+
+        fn release(j: *Job) void {
+            if (j.refs.fetchSub(1, .acq_rel) != 1) return;
+            if (j.result) |g| g.free(); // the request stopped waiting: nobody took it
+            j.gpa.free(j.text);
+            j.gpa.destroy(j);
+        }
+    };
 };
 
+/// A compiled grammar. Its matchers hold their own reference (xgrammar's shared state), so it can be freed while
+/// replies that use it run.
 pub const Compiled = struct {
     f: Fns,
     h: *anyopaque,
+    words: usize,
 
     pub fn free(g: Compiled) void {
         g.f.free(g.h);
@@ -106,6 +170,15 @@ pub const Compiled = struct {
 
     pub fn matcher(g: Compiled) !Matcher {
         return .{ .f = g.f, .h = g.f.matcher(g.h) orelse return error.Grammar };
+    }
+
+    /// A fresh reply's grammar, starting after `after` when thinking is on: a matcher, no compile.
+    pub fn constraint(g: Compiled, gpa: Allocator, after: ?u32) !*Constraint {
+        const m = try g.matcher();
+        errdefer m.free();
+        const out = try gpa.create(Constraint);
+        out.* = .init(m.rules(), g.words, after);
+        return out;
     }
 };
 
@@ -277,15 +350,6 @@ pub const Constraint = struct {
             }
         }
     };
-};
-
-/// A request's grammar for the engine: the server's compiler (which has compiled `text` once already), what to
-/// compile, the token it starts after.
-pub const Structure = struct {
-    compiler: *Compiler,
-    kind: Kind,
-    text: []const u8,
-    after: ?u32 = null,
 };
 
 /// Whether `token` is allowed by a row's bits.

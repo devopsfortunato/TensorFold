@@ -427,7 +427,10 @@ const Run = struct {
         // every refusal comes before the stream opens, so it gets the same 400 as a whole reply
         const prepared = chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| return r.unsent(&cx, e, field);
         var handed = false; // generate gives the preparing count back from here on
-        defer if (!handed) chat.release(r.srv, prepared.preparing);
+        defer if (!handed) {
+            chat.release(r.srv, prepared.preparing);
+            chat.freeStructure(&prepared.request);
+        };
         r.out.vt.open(r.out.ctx) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };

@@ -92,6 +92,72 @@ pub fn spec(cx: *Cx, body: Value) errors.Refused!?Spec {
     return null;
 }
 
+/// The largest grammar text a request may send (a schema as JSON, a regex, the choices as a JSON array, an EBNF).
+pub const max_bytes = 64 << 10;
+/// The deepest nesting it may have: a JSON schema's objects and arrays, a regex's or an EBNF's groups. xgrammar
+/// parses and converts them recursively on the request's thread.
+pub const max_depth = 64;
+
+/// A grammar past max_bytes or max_depth, refused before it compiles (the compile itself is bounded in time by
+/// Compiler.Limits).
+pub fn bounded(cx: *Cx, s: Spec) errors.Refused!void {
+    if (s.text.len > max_bytes) return cx.fail(.request, "{s}: the grammar is {d} bytes, more than the {d} this server compiles", .{ s.field, s.text.len, max_bytes });
+    const d = depth(s.kind, s.text);
+    if (d > max_depth) return cx.fail(.request, "{s}: the grammar nests {d} levels deep, more than the {d} this server compiles", .{ s.field, d, max_depth });
+}
+
+/// The deepest nesting of `src`: JSON's objects and arrays outside strings; a regex's groups (escapes skipped);
+/// an EBNF's groups outside its quoted literals.
+fn depth(kind: Kind, src: []const u8) usize {
+    const opens: []const u8, const closes: []const u8 = switch (kind) {
+        .json, .json_schema, .choice => .{ "{[", "}]" },
+        .regex, .grammar => .{ "(", ")" },
+    };
+    const quoted = kind != .regex; // a regex's quote is a literal character
+    var at: usize = 0;
+    var deepest: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const ch = src[i];
+        if (ch == '\\') {
+            i += 1;
+            continue;
+        }
+        if (quoted and ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+        if (std.mem.indexOfScalar(u8, opens, ch) != null) {
+            at += 1;
+            deepest = @max(deepest, at);
+        } else if (std.mem.indexOfScalar(u8, closes, ch) != null) {
+            at -|= 1;
+        }
+    }
+    return deepest;
+}
+
+test "a grammar's depth counts nesting outside strings and escapes" {
+    try std.testing.expectEqual(@as(usize, 3), depth(.json_schema, "{\"a\":{\"b\":[1,\"{[{[\"]}}"));
+    try std.testing.expectEqual(@as(usize, 1), depth(.json_schema, "{\"a\\\"{\":1}"));
+    try std.testing.expectEqual(@as(usize, 2), depth(.regex, "(a(b)\\(\\()\"("));
+    try std.testing.expectEqual(@as(usize, 1), depth(.grammar, "root ::= (\"(\" \"\\\"(\")"));
+    var deep: [2 * (max_depth + 1)]u8 = undefined;
+    @memset(deep[0 .. max_depth + 1], '[');
+    @memset(deep[max_depth + 1 ..], ']');
+    var cx: Cx = .{ .a = std.testing.allocator };
+    try std.testing.expectError(error.Refused, bounded(&cx, .{ .kind = .json_schema, .text = &deep }));
+    std.testing.allocator.free(cx.message);
+    try bounded(&cx, .{ .kind = .json_schema, .text = deep[1 .. deep.len - 1] });
+    const big = try std.testing.allocator.alloc(u8, max_bytes + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'a');
+    try std.testing.expectError(error.Refused, bounded(&cx, .{ .kind = .regex, .text = big }));
+    std.testing.allocator.free(cx.message);
+}
+
 /// ``grammar.refusal``: a malformed grammar, or one beside a required call, refused before any header.
 pub fn refusal(cx: *Cx, body: Value) errors.Refused!void {
     const s = try spec(cx, body) orelse return;

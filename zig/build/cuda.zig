@@ -142,6 +142,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // the CSF scale decoder against a checkpoint tensor (zig/tests/cuda/flashnext/csf_check.zig): host only
     const csf_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/csf_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "flashnext", .module = mods.flashnext } } });
     b.step("flashnext-csf", "tf-flashnext-csf SHARD NAME N K: sha256 of one projection's decoded CSF scales").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-csf", .root_module = csf_check }), .{}).step);
+    // structured output's mask kernel through Torch.grammarMask against a host reference (zig/tests/cuda/flashnext/grammar_mask_test.zig): one GPU
+    const mask_test = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/grammar_mask_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
+    b.step("flashnext-grammar-mask", "tf-flashnext-grammar-mask: the structured-output mask kernel against a host reference").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-grammar-mask", .root_module = mask_test }), .{}).step);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.

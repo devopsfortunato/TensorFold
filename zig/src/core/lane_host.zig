@@ -371,10 +371,11 @@ pub const LaneHost = struct {
         return .dropped;
     }
 
-    /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
+    /// A reply's grammar from the one the server compiled (Info.structures engines get requests that carry one): a
+    /// matcher only, so the engine thread never waits for a compile.
     fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
-        const c = st.compiler orelse return error.NoGrammarCompiler;
-        return c.constraint(h.gpa, h.io, @enumFromInt(@intFromEnum(st.kind)), st.text, st.after);
+        const g = st.compiled orelse return error.NoCompiledGrammar;
+        return g.constraint(h.gpa, st.after);
     }
 
     /// Every request waiting for a lane, admitted now: prompts that arrive together (a burst, with no resume or kept
