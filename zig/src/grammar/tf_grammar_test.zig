@@ -121,14 +121,27 @@ test "choice and EBNF compile; thinking starts the grammar after the think end; 
     try testing.expectError(error.Grammar, c.compile(.choice, "{}", &err));
 }
 
-test "compileWithin: one past the running limit is refused; one past its time is refused and freed by its thread" {
+test "compileWithin: one past the running limit waits for a slot, refused when none frees up; one past its time is refused and freed by its thread" {
     const gpa = testing.allocator;
     const io = testing.io;
     var c = try open();
     defer c.close();
     defer settle(io); // a refused compile's thread frees its job with the test's allocator
     var err: [512]u8 = undefined;
-    try testing.expectError(error.GrammarBusy, c.compileWithin(gpa, io, .json, "", .{ .running = 0 }, &err));
+    const began = std.Io.Clock.awake.now(io).toNanoseconds();
+    try testing.expectError(error.GrammarBusy, c.compileWithin(gpa, io, .json, "", .{ .running = 0, .timeout_ms = 30 }, &err));
+    try testing.expect(std.Io.Clock.awake.now(io).toNanoseconds() - began >= 30 * std.time.ns_per_ms);
+    // a slot that frees up within the wait: the compile runs
+    _ = grammar.running.fetchAdd(1, .acq_rel); // a compile that holds the only slot for 20 ms
+    const holder = try std.Thread.spawn(.{}, struct {
+        fn free(i: std.Io) void {
+            std.Io.sleep(i, .fromMilliseconds(20), .awake) catch {};
+            _ = grammar.running.fetchSub(1, .acq_rel);
+        }
+    }.free, .{io});
+    const waited = try c.compileWithin(gpa, io, .regex, "1a", .{ .running = 1 }, &err);
+    holder.join();
+    waited.free();
     const g = try c.compileWithin(gpa, io, .regex, "a1", .{}, &err);
     g.free();
     try testing.expectError(error.Grammar, c.compileWithin(gpa, io, .regex, "(", .{}, &err));
@@ -144,12 +157,12 @@ test "compileWithin: one past the running limit is refused; one past its time is
         }
         settle(io);
     }
-    // refused compiles still count until their threads end: one more past the limit is refused at once
+    // refused compiles still count until their threads end: with no wait, one more past the limit is refused at once
     const slow = [_][]const u8{ "a1", "1a", "a", "1" };
     for (slow) |t| {
         if (c.compileWithin(gpa, io, .regex, t, .{ .timeout_ms = 0, .running = slow.len }, &err)) |late| late.free() else |e| try testing.expectEqual(error.GrammarTimeout, e);
     }
-    if (grammar.running.load(.acquire) == slow.len) try testing.expectError(error.GrammarBusy, c.compileWithin(gpa, io, .regex, "a1", .{ .running = slow.len }, &err));
+    if (grammar.running.load(.acquire) == slow.len) try testing.expectError(error.GrammarBusy, c.compileWithin(gpa, io, .regex, "a1", .{ .timeout_ms = 0, .running = slow.len }, &err));
     std.debug.print("{d} of 8 compiles past a zero wait were refused\n", .{refused});
 }
 

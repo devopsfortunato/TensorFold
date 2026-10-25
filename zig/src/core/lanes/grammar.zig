@@ -87,20 +87,24 @@ pub const Compiler = struct {
     }
 
     pub const Limits = struct {
-        /// the longest a request waits for its compile; past it the request is refused and the compile ends alone
+        /// the longest a request waits, for a free slot and then for its compile; past it the request is refused
+        /// and the compile ends alone
         timeout_ms: u32 = 10_000,
-        /// compiles at once, those past their timeout included; one more is refused (error.GrammarBusy)
+        /// compiles at once, those past their timeout included; a request waits for a slot within its timeout
         running: u32 = 4,
     };
 
     /// `compile` on a thread of its own, waited for at most `limits.timeout_ms` (xgrammar cannot stop a compile):
     /// error.GrammarTimeout past it, and the thread frees what it compiles; error.GrammarBusy when `limits.running`
-    /// compiles run already, so grammars that never finish cannot pile up threads.
+    /// compiles run for the whole wait, so grammars that never finish cannot pile up threads.
     pub fn compileWithin(c: *const Compiler, gpa: Allocator, io: std.Io, kind: Kind, text: []const u8, limits: Limits, err: *[512]u8) !Compiled {
         err[0] = 0;
-        if (running.fetchAdd(1, .acq_rel) >= limits.running) {
+        const began = std.Io.Clock.awake.now(io).toNanoseconds();
+        const budget: i96 = @as(i96, limits.timeout_ms) * std.time.ns_per_ms;
+        while (running.fetchAdd(1, .acq_rel) >= limits.running) {
             _ = running.fetchSub(1, .acq_rel);
-            return error.GrammarBusy;
+            if (std.Io.Clock.awake.now(io).toNanoseconds() - began >= budget) return error.GrammarBusy;
+            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch return error.GrammarBusy;
         }
         const job = gpa.create(Job) catch {
             _ = running.fetchSub(1, .acq_rel);
@@ -118,7 +122,8 @@ pub const Compiler = struct {
             return error.GrammarBusy;
         };
         thread.detach();
-        job.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(limits.timeout_ms), .clock = .awake } }) catch {
+        const left = @max(budget - (std.Io.Clock.awake.now(io).toNanoseconds() - began), 0);
+        job.done.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(left), .clock = .awake } }) catch {
             job.release(); // the thread frees the job and its grammar when the compile ends
             return error.GrammarTimeout;
         };

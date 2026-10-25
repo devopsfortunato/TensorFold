@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var ops = try torch_ops.Ops.load(&ctx);
     defer ops.deinit();
-    var stream = try cuda.Stream.init(&driver, true);
+    var stream = try cuda.Stream.init(&driver, false); // blocking: it waits for fromHost's copies on the legacy stream
     defer stream.deinit();
     var prng = std.Random.DefaultPrng.init(0x6d61736b);
     for (cases) |c| run(init.gpa, &driver, &ops, stream, c, prng.random()) catch |e| {

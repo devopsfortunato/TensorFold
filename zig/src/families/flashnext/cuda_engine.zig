@@ -1489,7 +1489,9 @@ pub const Engine = struct {
             e.gmask = try cuda.DeviceBuffer.alloc(e.ctx.d, @max(bytes, state.max_rows * ((V + 31) / 32) * 4));
         }
         try e.stream.synchronize(); // the last draw's mask read is done before the upload
-        try e.gmask.?.upload(0, std.mem.sliceAsBytes(masks));
+        // on the engine's stream, ahead of the kernel: a plain copy runs on the legacy stream, which this non-blocking
+        // stream does not wait for, and from pageable memory it can return before its DMA lands (a stale mask)
+        try e.gmask.?.uploadAsync(0, std.mem.sliceAsBytes(masks), e.stream.handle);
         try e.f.th.grammarMask(logits_base + row0 * V * 2, V, rows, V, e.gmask.?.ptr, masks.len / rows);
     }
 
@@ -1514,7 +1516,7 @@ pub const Engine = struct {
         if (row.len != e.g.head_n * 2) return error.BadFirstRow;
         try e.stream.synchronize();
         const dev: cuda.DeviceBuffer = .{ .d = e.ctx.d, .ptr = e.last_logits, .len = row.len };
-        try dev.upload(0, row);
+        try dev.uploadAsync(0, row, e.stream.handle); // ordered before the mask and the draw, as in maskRows
         try e.maskRows(e.last_logits, 0, 1, mask);
         const smp: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
         var first: [1]u32 = undefined;
