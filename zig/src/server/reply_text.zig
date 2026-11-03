@@ -247,13 +247,13 @@ pub fn heldBack(text: []const u8, tools: bool) []const u8 {
     return if (tools) text[0..pyRstrip(text).len] else text; // a prefix, so the stream's pointer checks still hold
 }
 
-/// Prose safe to send before final parsing settles the first hidden closed envelope.
+/// Prose safe to send before final parsing settles the first hidden closed envelope; the finish sends its tail.
 pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
     // attachCalls has not yet decided whether to strip the reply's content.
     if (pyLstrip(text).len != text.len) return text[0..0];
     var out: std.ArrayList(u8) = .empty;
     const prose = try hideInto(a, &out, text, true, true, shared_openers);
-    return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
+    return prose[0..pyRstrip(prose).len];
 }
 
 /// A reply max_tokens cut inside a call it returns: the open envelope is that call, not text (#1238).
