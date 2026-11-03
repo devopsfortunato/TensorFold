@@ -1,138 +1,105 @@
-# The recipe book
+# Recipe book
 
-This is how we made three model families decode fast and byte-exact on Apple Silicon, and how to do the same
-for yours. The per-family pages record what worked with the numbers we measured, what we tried and threw
-away, and what we would try next:
+Each family page describes its supported checkpoint, kernels and operating limits, and says which engine it covers:
+the native engine, or the Python engine frozen at 0.6.6.
 
-- [Qwen3.8 Flash Next](qwen3.8-flash-next.md): 512-expert MoE, hyper-connections, sparse attention and an
-  MTP head, on an M3 Ultra.
-- [Nemotron 3.5 Lightning](nemotron-3.5.md): Mamba-2 and MoE, decoded one step ahead, on an M5 Max.
-- [Qwen3.8-27B dense](qwen3.8-27b.md): DeltaNet and full attention with a DFlash2 draft model and tensor-unit
-  kernels, on an M5 Max.
-- [Adding a family](adding-a-family.md): the package interface, the checks and the tests.
+For agent-assisted contributions, read the [TensorFold contributor skill](SKILL.md) before implementing a native family, kernel or serving change.
 
-On NVIDIA GPUs (DGX Spark), the same contract with CUDA kernels:
+| Family | Recipe |
+| --- | --- |
+| Nemotron 3.5 Lightning | [MLX](nemotron-3.5.md), [Intel Arc, experimental](xpu-arc.md) |
+| Nemotron 3.5 Super VL | [Native CUDA on one or two GB10s, images](nemotron-3.5-super-vl.md) |
+| Qwen3.8-27B | [MLX, quantization and CUDA](qwen3.8-27b.md) |
+| Qwen3.5-2B | [Native Metal preview, tied affine 4-bit](qwen3.5-2b-native.md) |
+| Qwen3.8 Flash Next | [MLX prefill and CUDA](qwen3.8-flash-next.md), [native CUDA](flash-next-cuda.md), [CUDA images](flash-next-vision.md), [exact SSD residency on Metal](fluid-subgraph-residency.md) |
+| Qwen4 dense | [Native preparation, device qualification pending](qwen4-dense.md) |
+| Ternary Bonsai 2 27B | [MLX](ternary-bonsai-2.md) |
+| GLM-5.3-Flash | [MLX on a 256 GB Mac, two-rank CUDA](glm-5.3-flash.md), [native CUDA](glm-5.3-flash-cuda.md) |
+| Gemma 4 26B-A4B | [MLX, fused one-row decode](gemma-4.md) |
+| Gemma 4 31B | [Native Metal, affine 4-bit](gemma-4-native.md) |
+| Gemma 4 12B | [Native Metal, affine 4-bit, MTP assistant](gemma-4-12b-native.md) |
+| DeepSeek-V4-Flash | [MLX on a 256 GB Mac, DSpark and MTP drafts](deepseek-v4-flash.md) |
+| Qwen3.6-35B-A3B | [MLX with MTP drafts, one-GPU CUDA](qwen3.6-moe.md) |
+| Step-5-Preview | [Native Metal on one 256 GB Mac: 2-bit experts, MTP drafts, images](step-5-preview.md) |
+| MiniMax-M3.1-Flash | [Native Metal on one 256 GB Mac: affine 3/4-bit experts, exact bf16 cache, DFlash2 drafts, images](minimax-m3.1-flash.md) |
+| Kolibri-1 | [Native CUDA, block FP8, research checkpoint](kolibri-1.md) |
+| LFM2.5-24B-A2B | [Native Metal, MLX 4-bit, shared rounds](lfm2.5-24b-a2b.md) |
+| Spark-X2.6-4B | [Native CUDA](spark-x2.6-4b-cuda.md), [native Metal, the bf16 release, contexts to 1M](spark-x2.6-4b-metal.md) |
 
-- [The CUDA recipe book](cuda.md): the method, the numbers against vLLM, and the traps.
-- [Adding a CUDA family](adding-a-cuda-family.md): the engine interface, the exactness tests, measuring.
-- [GLM-5.3-Flash](glm-5.3-flash.md): two Sparks, CUDA only.
+## Capability floor
+
+The native binary's CUDA build runs Nemotron 3.5 Lightning on GB10 and on Ampere cards with compute capability 8.0 (the
+A100) and 8.6 (the RTX 30 series, RTX A6000, A10 and A40). On a Mac, `tensorfold info REPO` prints a
+checkpoint's memory floor: its weights plus a 2 GiB runtime margin. The table below is the Python 0.6.6 engine's, quoted
+from its family pages, not measured per card.
+
+| Engine | Floor |
+| --- | --- |
+| CUDA, other families | Compute capability 8.9 or newer: Ada RTX 40, Hopper, and Blackwell cards (RTX 50, RTX PRO 6000, DGX Spark GB10). RTX 30 (8.6) is not supported yet. |
+| Flash Next, CUDA | sm_120 and sm_121 only: DGX Spark GB10, RTX 50, RTX PRO 6000. A card below sm_120 refuses Flash Next at startup. |
+| Intel GPU (XPU), Nemotron | Experimental. Weights need 17.3 GiB of device memory (18 to 19.4 GB in use from 4k to 128k context); measured on an Arc Pro B70 (32 GB). Cards below 24 GB are untested and a 16 GB card cannot hold the weights. |
+| MLX, Apple Silicon | GLM-5.3-Flash is written for a 256 GB Mac, about 151 GiB resident. DeepSeek-V4-Flash is the same, about 151 GiB resident. Flash Next's default command sizes to a 128 GiB M4 Max. Qwen3.8-27B on a 32 GB Mac needs more than the default 22.4 GiB. Machine classes, not measured minimums. |
+
+New families go on the Zig engine: [adding a Zig family](adding-a-zig-family.md) has the steps in order, what each
+one gained, and which code owns it. For the Python engine, frozen at 0.6.6, the contributor guides cover
+[adding an MLX family](adding-a-family.md), [adding a CUDA family](adding-a-cuda-family.md) and
+[CUDA implementation rules](cuda.md).
+[Training a drafter](training-a-drafter.md) takes a target's `--record` output to a learned block drafter, with
+what each step gained on Kolibri-1.
+[EXL3 weights](exl3.md) and [universal EXL3 experts](exl3-universal-experts.md) describe the shared EXL3
+module @vcruz305 wrote for the Python engine's CUDA families in [#42](https://github.com/ashhart/TensorFold/pull/42):
+any codebook, any width per tensor, one grouped launch per MoE projection.
 
 ## The contract
 
-A multi-row step verifies several consecutive positions in one forward. It is exact when every row gets the
-bits a one-row step of the same engine gives that position. Then drafted decoding commits the same tokens as
-one-token-a-round decoding, byte for byte. "Serial" always means the same engine and kernels one token at a
-time, not stock MLX.
+Drafted output must equal the same engine's serial output. A resumed prompt must equal that prompt served
+fresh, and every concurrent stream must equal its solo run. This contract applies within the same weights,
+runtime and settings; another backend or quantization can have different arithmetic.
 
-Sampling is keyed. The token at absolute position p is the argmax over the kept candidates of `logit / T` plus
-Gumbel noise hashed from the seed, p and the token id. The candidates are the top-k logits (ties broken by id)
-cut to the smallest set holding top-p of the probability. That is an exact draw from the model's top-k/top-p
-distribution, and it depends only on the row's logits and its position. So a draft is accepted exactly when it
-equals the token serial decoding samples there. Why not greedy decoding, which would be simpler: greedy
-Qwen3.8 looped in an agent session, one tool call repeated six times and then replies doubling to 32k tokens.
+The sampler keys each draw by seed, absolute position and token ID. A draft is accepted only when it
+matches that draw from the target. Each verify row must use the serial row's arithmetic, including
+attention boundaries, routing ties and recurrence updates. Rollback must restore all state after the
+accepted path, including draft-head state.
 
-There are two implementations of the rule. `engine/exact_sampling.py` finishes on the host in float64.
-`engine/gpu_sampling.py` runs the same rule on the GPU in fp32 and leaves the token on the GPU. They can pick
-different tokens at rare near-ties, so a model uses one of them for serial and drafted rounds alike.
+Prompt reuse is equally strict. The MLX planner computes chunks from rendered tokens and caches only
+compatible boundaries. Its resume points are assistant-message starts and the second message start
+when the tokenizer exposes those markers. Chunks skip resume points less than 256 tokens from the
+previous start and otherwise end at the first eligible point or after 2,048 tokens. Without recognized
+markers, chunks use the 2,048-token grid. Rewriting earlier template text can invalidate reuse.
+The chunk scheme and kernel/runtime identity must match before a stored prefix can be reused.
 
-## Three ways to make projections row-invariant
+## Measurements
 
-All three are in use, and which one fits depends on your MLX version and GPU.
+`tools/bench_openai.py` contains public fixtures: a raw Fibonacci-function prompt and a chat prompt asking
+how matrix multiplication uses a GPU. The chat fixture disables thinking. After starting a server with
+`--name bench`, run from the repository root:
 
-| Strategy | How | Used by | Cost |
-| --- | --- | --- | --- |
-| A | Use MLX's quantized matmul where it happens to be row-invariant, and check that at load | Nemotron on an M5 Max with MLX 0.31.2 (identical through 9 rows) | free, but breaks when MLX or the GPU changes |
-| B | Reproduce MLX's one-row kernel arithmetic for every row and share only the weight reads | Flash Next's `qmv_rows` on an M3 Ultra with MLX 0.32.0 | keeps MLX's one-row bits; each row still pays its own arithmetic |
-| C | Write new row-invariant arithmetic and run serial decoding through it too, so it becomes the reference | the 27B lane matmul on M5 tensor units; Flash Next's glue, router, expert and hyper-connection kernels | needs its own quality check, and one row can cost more than MLX's vector kernel |
+```bash
+python3 tools/bench_openai.py http://127.0.0.1:8080 bench \
+  --tokens 64 --reps 5 --temperatures 1.0,0 --output bench.json
+```
 
-## The method
+The client warms each cell, uses seeds 1234 through 1238, and reports the median decode rate after the
+first token. Sampled cells use temperature 1, top-k 20 and top-p 0.95. The client sends `ignore_eos: true`;
+MLX, GLM CUDA and the Qwen3.8-27B and Qwen3.6 CUDA engines honor it, while the Flash Next and Nemotron CUDA engines can stop
+at EOS before the requested limit.
+It measures throughput; it does not itself prove token equality. Record checkpoint and tokenizer revisions,
+runtime versions, backend, rank count, launch command and output hashes with a result. Compare serial and drafted output separately.
 
-1. Serve it serially first. The serial engine serves any family package, one token per forward with keyed
-   sampling. That output is the reference every faster path has to reproduce.
-2. Get a trusted forward and check it. Nemotron reuses mlx_lm's blocks with the backbone and head split apart.
-   Flash Next has a new forward written from the checkpoint layout, matched layer by layer against an existing
-   MLX implementation. Detect conversion conventions at load (Flash Next's conversion stores centred norms
-   around 1 instead of 0). Check teacher-forced NLL and top-1 agreement against the reference, and compare with
-   how far the reference's own prefill and decode paths disagree (0.953 top-1 for mlx_lm on Nemotron).
-3. Measure the floor and the gap. The floor is weight bytes read per token over the measured read bandwidth.
-   Then count kernels and split host time from GPU time. Metal System Trace (`xctrace`) attached to the server,
-   with `MLX_MAX_OPS_PER_BUFFER=1` to get about one GPU interval per kernel, shows where the time goes. What we
-   started from: Nemotron 7.3 ms a token against a 3.7 ms floor with about 900 kernels; Flash Next about 33 ms
-   against about 5 ms with about 4,500 kernels; the 27B about 33 ms against about 30, already near its floor.
-4. Fuse. One kernel per step between weight reads, projections that share an input stacked into one matrix,
-   small matvecs folded together, fixed-shape blocks compiled, the graph handed to the GPU every 4 to 8 layers.
-   Nemotron went from about 900 to 370 kernels a token and from 138 to about 160 tok/s; Flash Next from about
-   4,500 to 690 kernels and from 30 to 79 tok/s serial. On the 27B, fusing about 1,100 glue kernels saved only
-   1 to 3 ms of a 45 ms forward: that forward is the matmuls in dependency order. Fusion loses when it removes
-   parallelism. One threadgroup reading Nemotron's router cost 220 to 141 tok/s, and folding a norm into a
-   split projection made every threadgroup redo the norm.
-5. Overlap host and GPU. Draw tokens on the GPU and feed them to the next forward before reading them. When a
-   step runs one ahead, alternate its KV writes between two buffers (MLX otherwise copies a buffer the previous
-   step still reads). Use bigger command buffers. Cap MLX's buffer cache in a long-running server.
-6. Make every kernel row-invariant: rows in a fixed order, no reduction across rows, sparse selection per row,
-   attention split by the row's own length, ties broken by id, fp32 where the training framework keeps fp32.
-   Pick strategy A, B or C for the projections. Check at load and switch drafting off when the check fails.
-7. Test exactness at every level (see [adding a family](adding-a-family.md#tests-to-write)). Regenerate stored
-   references after every kernel edit.
-8. Add drafting, cheapest first:
-   - Copy windows: continue the longest earlier occurrence of the context's suffix, enter only with 8 or more
-     matching tokens, verify up to 7 copied tokens a round. Agent traffic has less of this than it seems:
-     across 225 recorded sessions, 17 to 35% of output tokens were copyable, which caps a copy-only speedup at
-     1.2 to 1.5x. File edits are where copies shine.
-   - The model's own MTP head, if the checkpoint has one (convert it from the BF16 release if the MLX
-     conversion dropped it). Sample drafts with the target's keyed sampler at their own positions, so a draft
-     is the target's token wherever the two distributions agree. Choose the depth from recent acceptance and
-     the cost of a verify row.
-   - A separate draft model with trees, where extra rows are cheap. On M5 tensor units 16 rows cost about what
-     one does.
-   - Predict before you build: tokens a round times round time, from what you have already measured.
-9. Serve it properly: prefix snapshots keyed by kernels and MLX version, prompts prefilled through the decode
-   path (or a documented dependence on what was cached), a thinking budget that depends only on the token
-   count, pinned system blocks, and background priority for side requests such as session titles.
-10. Measure honestly: a quiet machine, after warm-up, cool and hot, power mode noted. Decide with live A/B runs
-    inside one process, blocks of rounds alternating with rests between, identical output hashes.
+For concurrent MLX workloads, use `tools/bench_concurrent.py` with `--alone --serial` to compare each
+concurrent reply with a solo run and check those solo runs against `draft: false`. Long-context and memory
+measurements also need a public prompt fixture and its exact rendered-token count. Separate cold, resumed
+and post-restart requests.
 
-## Traps we hit
+All 0.3.5 decode, prefill, concurrency and peak-memory results are TBD [release-0.3.5]. Older public-fixture
+results in the CUDA family pages are historical measurements, not release qualification.
 
-- MLX's quantized matmul row invariance depends on the MLX version and the GPU. On an M5 Max with MLX 0.31.2
-  rows match through 9 rows and differ from 10. With MLX 0.32.2 on the same machine, row 0 of a 2-row call
-  already differs. On an M3 Ultra with MLX 0.32.0, 2 to 4 rows differ. Check at load on the machine you serve
-  from.
-- MLX's bf16 (unquantized) matmul can also sum 2 rows differently from 1. Nemotron's router logit came out one
-  bf16 unit off at layer 29 of a real decode.
-- bf16 router logits over 512 experts tied at the top-10 cut in about a third of Flash Next's layers, and the
-  tie decided which expert ran. Keep router logits in fp32 and break ties by id.
-- MLX's attention picks its kernel by query count and switches variants with the key count. A multi-row window
-  run through it does not match single queries.
-- Metal 4 tensor-unit kernels written for the M5 compute wrong values on an M3 Ultra (`applegpu_g15`). Gate
-  them by GPU generation (`applegpu_g17` and later).
-- Metal's fast math lets the compiler reassociate after any source edit, even one that leaves the arithmetic
-  alone. Key snapshots by kernel source and regenerate stored references after every kernel change.
-- A kernel templated on a per-token value (key count, row count) compiles a new kernel every token: one forward
-  took 280 ms. Pass such values in a small int buffer. MLX caches compiled kernels by name, so put a hash of
-  the source in the name, and look kernels up by name rather than re-hashing the source on every call (that
-  cost about 2 ms of host time a step on Flash Next).
-- `mx.fast.metal_kernel`'s grid counts threads, not threadgroups. Writing threadgroup counts runs singleton
-  simdgroups whose `simd_sum` does nothing. MLX may also bind a small input as `constant` rather than `device`,
-  so declare derived pointers with `auto`.
-- Strided inputs, `mx.take` outputs and column slices can change kernel paths or force a copy. Kernels must
-  read the real strides.
-- Lazy arrays created on one thread cannot be evaluated on the server's engine thread. Evaluate derived weights
-  (stacked matrices and their views) at load.
-- Decoding one step ahead makes MLX copy a KV buffer the previous step still reads, about 1 ms a token at 60k
-  context on Nemotron. Alternate between two buffers.
-- The fused decode path and a reference prefill path differ in their last bits, so prefilling prompts through
-  the reference path makes a reply depend on chunk boundaries and on what was cached. The 27B fixed it by
-  prefilling through its decode kernels.
-- Microbenchmarks of many independent calls pointed the wrong way nine times. They fill the GPU whatever the
-  kernel's parallelism. Time dependent chains, then confirm live.
-- A laptop slows every kernel 20 to 40% after a long prefill or a few minutes of decoding, and runs about 3x
-  slower on battery. A benchmark running while the server warms its snapshots gets half the bandwidth.
+## Kernel checks
 
-## A known limit
+Use exact equality for serial versus multi-row kernels and committed caches. Use a separate trusted
+forward for model-quality checks; agreement with one's own serial implementation does not establish
+model fidelity. Include real head dimensions, sparse-attention boundaries, partial keeps and concurrent
+streams at different lengths. After changing a kernel or runtime, regenerate serial references.
 
-For Flash Next and Nemotron, prompts are prefilled through the reference path in 2,048-token chunks, while a
-short suffix after a cache hit (16 tokens or fewer) goes through the fused decode kernels. Their last bits can
-differ, so the same request can get a different reply depending on what was cached. Drafted and serial
-decoding from the same cache state stay byte-identical. The 27B has no such dependence: it prefills through
-the lane kernels, which give every prompt row the bits serial decoding gives it.
+Measure dependent operations and complete requests. Independent microbenchmarks can hide launch cost,
+weight-cache effects and lost overlap with other work.

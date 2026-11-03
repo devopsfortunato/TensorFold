@@ -14,10 +14,12 @@ import collections
 import glob
 import json
 
-from tokenizers import Tokenizer
+import sys
 
 
-def main() -> None:
+def text_main() -> None:
+    from tokenizers import Tokenizer
+
     p = argparse.ArgumentParser()
     p.add_argument("tokenizer")
     p.add_argument("out")
@@ -27,6 +29,9 @@ def main() -> None:
     p.add_argument("--max-bytes", type=int, default=2_000_000, help="skip files larger than this")
     p.add_argument("--min-count", type=int, default=10,
                    help="leave out ids seen fewer times (rare names and one-off words); the id prefix fills the rest")
+    p.add_argument("--added-tokens", action="store_true", help="always keep the tokenizer's added (special) tokens")
+    p.add_argument("--base", help="an existing list kept whole (the new ids extend it)")
+    p.add_argument("--exclude", help="ids never kept (tokens the privacy gate flags)")
     args = p.parse_args()
     tok = Tokenizer.from_file(args.tokenizer)
     counts: collections.Counter = collections.Counter()
@@ -45,19 +50,36 @@ def main() -> None:
         total += len(ids)
         used += 1
     keep = set(range(args.keep_below))
+    if args.added_tokens:
+        keep |= {t["id"] for t in json.loads(open(args.tokenizer).read())["added_tokens"]}
+    if args.base:
+        keep |= {int(t) for t in open(args.base).read().split()}
+    drop = {int(t) for t in open(args.exclude).read().split()} if args.exclude else set()
+    keep -= drop
     for tid, count in counts.most_common():
         if len(keep) >= args.size or count < args.min_count:
             break
-        keep.add(tid)
+        if tid not in drop:
+            keep.add(tid)
     fill = iter(range(args.keep_below, tok.get_vocab_size()))
     while len(keep) < args.size:                       # the id prefix fills a short list
-        keep.add(next(fill))
+        t = next(fill)
+        if t not in drop:
+            keep.add(t)
     ids = sorted(keep)
     covered = sum(c for t, c in counts.items() if t in keep)
     with open(args.out, "w") as handle:
         handle.write("\n".join(str(i) for i in ids) + "\n")
     print(json.dumps({"files": used, "tokens": total, "size": len(ids), "coverage": round(covered / max(1, total), 4),
                       "from_counts": sum(1 for t, c in counts.items() if c >= args.min_count and t in keep)}))
+
+
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "responses":
+        from draft_vocab_responses import main as response_main
+        response_main(sys.argv[2:])
+    else:
+        text_main()
 
 
 if __name__ == "__main__":

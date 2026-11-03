@@ -1,258 +1,379 @@
-# Qwen3.8-27B dense (`qwen3_5`)
+# Qwen3.8-27B
 
-Measured on an M5 Max with 128 GB, MLX 0.31.2 and mlx-lm 0.31.3, with the 4-bit checkpoint. Package:
-`src/tensorfold/families/qwen3_5/`, engine `engine/lane_engine.py`, kernels in `src/tensorfold/kernels/`,
-drafter in `src/tensorfold/drafters/`. The same checkpoint and drafter on NVIDIA GPUs (one or two DGX Sparks)
-are at the end: [DGX Spark (CUDA)](#dgx-spark-cuda).
-
-## What decides the speed
-
-- 64 layers: 48 Gated DeltaNet layers and 16 full-attention layers (every fourth). Hidden size 5,120 and a
-  dense SwiGLU MLP of width 17,408 in every layer.
-- Attention: 24 query heads over 4 KV heads, head dim 256, rotary on a quarter of each head. The query
-  projection also produces an output gate.
-- DeltaNet: 16 key heads and 48 value heads of dim 128, conv kernel 4. The fp32 recurrent state is about 3 MB
-  a layer.
-- Vocabulary 248,320. 4-bit affine weights in groups of 64: about 14.4 GB read per forward.
-- One row is bandwidth-bound: the chip reads about 569 GB/s, MLX's one-row 4-bit kernel reaches 470-560 GB/s.
-  So serial decoding tops out in the 20s of tok/s, and everything above that comes from verifying several
-  drafted tokens per forward.
-- Extra rows are nearly free up to 16 on the tensor units. Past 16 each row costs about 1.35 ms: a 32-row
-  forward takes 60-63 ms against 44 for 16, and 64 rows take 117 ms.
-
-## What worked
-
-Speeds through the server, each byte-identical to the same server decoding serially:
-
-| Step | HTML via a tool call | Code | Story | Whole-file edit |
-| --- | --- | --- | --- | --- |
-| MLX kernels, exact only up to 9 rows | 24.3 | 25.5 | 20.9 | |
-| lane matmul, DFlash2 chains, 8-bit drafter, greedy | 93.3 | 69.0 | 35.0 | |
-| plus pipelined graph build, 4-bit drafter, lane attention, greedy | 113.8 | 79.8 | 43.3 | |
-| same, sampled (T 1.0, top-k 20, top-p 0.95) | 99.6 | 76.5 | 37.3 | |
-| plus draft trees, sampled | 120.6 | 99.1 | 50.0 | |
-| plus half-precision P, calibrated trees, in-place commits | 134 | 116 | 54 | 295 |
-| plus exact prompts through the lanes and the 8-token copy rule | 129 | 109 | 57 | 339 |
-| plus tiled weights and a draft vocabulary | 152 | 126 | 66 | 388 |
-
-In agent sessions with thinking on and 21-23k tokens of context, short turns ran 75-94 tok/s on a cool machine
-(4.0-5.2 tokens a round, 45-55 ms rounds) and 60-69 once hot. A 4,567-token copy task ran 319 tok/s. Prompt
-processing that stays exact to token-by-token feeding runs 464-572 tok/s.
-
-The pieces, in the order they paid:
-
-1. Lane matmul (`kernels/lane_qmm.py`): 4-bit weights times bf16 activations on the M5 tensor units, one
-   arithmetic for every row count. Whole-model forward at 1/2/4/8/16 rows: 46.8/47.1/48.1/49.7/53.7 ms,
-   against MLX's 32.9/35.2/49.2/86.8/112.6. One row costs about 1.35x MLX's vector kernel; 16 rows cost what
-   one does.
-2. Pipelined graph build: building the 64-layer graph in Python took about 8 ms with the GPU idle. Handing it
-   to the GPU every 4 layers took the forward from 46.6 to 38.7 ms at one row, same graph and bits.
-3. The DFlash2 block drafter: 5 layers, trained on blocks of 8, reading the target's hidden states at layers
-   5, 19, 33, 47 and 61. At 4 bits a block costs about 7.5 ms against 12.5 at 8 bits, same acceptance.
-4. Lane attention (`kernels/qwen/dense/v1/lane_attention.py`): decode attention for 1-128 queries with fixed arithmetic. At
-   20k keys an 8-row window cost 0.42 ms a layer against 1.36 for MLX run query by query.
-5. Draft trees: best-first over the drafter's candidate lattice, 4 children a node, up to 15 nodes, the scores
-   carrying the target's own Gumbel noise, all verified in one forward. Offline tokens a pass: code 4.35 to
-   5.57, HTML 3.33 to 4.36, story 2.89 to 3.73. Calibrating the scores on about 1,500 traced rounds gave 6.5%
-   more accepted tokens.
-6. One 32-row tensor op for 17-32 rows: a 17-row forward went from 75 to 60 ms, so copy chains run up to 31
-   nodes (whole-file edits 239 to 293 tok/s).
-7. Commits that no longer copy the KV cache: 7 ms a round at 20k context and 12 at 40k, down to 2.7.
-8. Fused glue kernels (`kernels/lane_glue.py`): residual add plus RMSNorm plus the next matmul's group sums,
-   the DeltaNet conv, SiLU, q/k norms and gates, the gated norm, SiLU(gate) times up. Small gain, as noted in
-   the method.
-9. Exact prompts through the decode path in 128-row chains (`LaneEngine.lane_prefill`). MLX's chunked prefill
-   gives a prompt row different bits depending on where the chunk boundaries fall, and those followed the
-   cached prefix: 4 of 12 replayed requests differed between two servers.
-10. MLX's buffer cache capped at 8 GB: a 33k-token prefill had left a 103 GB process.
-11. The copy rule: a verbatim copy backed by 8 or more matching tokens replaces the tree. Such a match existed
-    in about 25% of tree rounds and its next token was right 94% of the time.
-12. Tiled weights: each 4-bit weight regrouped in place into contiguous 1 KB blocks per 32-column tile and
-    64-input group, same bytes and bits. Rounds 58.2 to 49.7 ms.
-13. A draft vocabulary: 99.64% of committed tokens have ids below 98,304, so the drafter reads only those head
-    rows (40% of the head). Verification still reads the whole vocabulary.
-14. A session n-gram prior on tree scores at weight 0.1: 4.49 to 4.62 tokens a pass, kept on only while it
-    helps the stream.
-15. Serving: pinned system-block snapshots (a fresh session reused 21,415 of 21,481 prompt tokens and started
-    in 0.42 s) and session-title requests as preemptible background jobs (first token 1.3 s to 0.27 s). One
-    request decodes at a time: a second request sharing rounds turns drafting off.
-
-## Tried and rejected
-
-- MLX's own quantized matmul for verify windows: rows match only up to 9, and a 9-row check costs 4.3x a
-  one-row step.
-- An exact replica of MLX's 8-bit one-row kernel for 32 rows on an M3 Ultra: bit-identical, but 1.84 ms
-  against 0.81 for MLX's non-exact batched kernel, and a 32-position round cost 307-363 ms.
-- Int8 activations on the tensor units: 27% faster per op, not faster end to end, 7x the error.
-- Wider windows and trees: 64-row windows cost twice 32; 31-node trees gave 7% more tokens for 1.6x the
-  matmul time; 127 nodes gave 5.47 tokens a round against 4.57 at 15, at about 4x the cost.
-- Matmul variants that were faster alone and slower live: a pipelined group loop (+5% alone, -2.7% live), a
-  per-shape split-K table (17% faster in a microbenchmark, rounds 53.3 to 69.3 ms live), software prefetch,
-  tile-major scales, unpacking each tile once per threadgroup (0.72-0.88x).
-- Memory-system tricks: hardware async copies into threadgroup memory cannot be reached from Metal source; a
-  last-level-cache prefetch pass costs more than it saves.
-- Attention: 1,024-key chunks win above about 40k keys, lose at 2-20k, and change the bits. Keys staged in
-  threadgroup memory were 33-45% slower.
-- Drafting: the checkpoint's MTP head as a sequential chain gave more tokens a pass (5.33 against 4.55) but a
-  step costs 1.5-2.9 ms, and with about 7 ms of drafting per 50 ms round a sequential guess must cost under
-  0.5 ms. A relay drafter (the MTP layer over a lane tree) guessed 13-19% more tokens a round but ran slower
-  live, 72.3 against 76.0 tok/s. Fine-tuning DFlash2 on 372k of the target's tokens gave no gain. Drafters
-  trained from scratch on rented H200 GPUs reached 3.8-5.1% first-token acceptance.
-- The ceiling is the drafter's candidates, not the tree search: the truth is in the top 16 for 6.5-7.0 tokens
-  a round, and no scorer picked the right candidate more than about 75% of the time past depth 1.
-- Parallel lanes without a drafter (Jacobi decoding): 1.07 tokens a pass.
-
-## Macs without tensor units (M1 to M4)
-
-The lane kernels need the M5's tensor units. Before 0.3.3 other Macs served the 27B at serial speed: the
-rounds that keep DFlash2 following the kept rows were switched on only with the lane kernels, so the drafter
-stopped after its first round. Since 0.3.3 every Mac drafts:
-
-- Verify windows of 2 to 8 rows go through `kernels/qwen/dense/v1/row_qmv.py`, MLX's one-row matvec loop run
-  once per row with each weight word read once for all the rows. A row's bits don't depend on the row count,
-  and they equal MLX's own one-row call, so serial decoding stays on MLX's kernel. MLX 0.32's own multi-row
-  matmul sums a row differently when 2 or more rows ride together, so it can't verify drafts exactly.
-- Windows attend query by query (`kernels/qwen/dense/v1/exact_attention.py`), and a partly accepted window is
-  rolled back to exactly its kept rows, so DFlash2 reads the kept rows' hidden states.
-- At load the engine checks which window widths reproduce one-row decoding on this Mac and times each width.
-  Each round then drafts the number of tokens with the most expected tokens a millisecond at the request's
-  recent acceptance, none when drafting doesn't pay, with one draft every 8 idle rounds to keep the estimate
-  current.
-
-Measured on an M3 Ultra (MLX 0.32.0) through the server, 64-token replies, median of seeds 1234-1238, thinking
-off (tools/bench_openai.py):
-
-| | Code, sampled | Chat, sampled | Code, greedy | Chat, greedy |
-| --- | ---: | ---: | ---: | ---: |
-| Serial (`--no-drafts`) | 38.2 | 38.2 | 39.3 | 39.3 |
-| 0.3.3: DFlash2, per-round draft count, row-exact matvec | 63.9 | 47.0 | 64.4 | 51.6 |
-| 0.3.4: the lane decoder and the simdgroup matmul (3 seeds) | 141.3 | 73.9 | 158.4 | 74.2 |
-| Speedup, 0.3.4 | 3.70x | 1.93x | 4.03x | 1.89x |
-
-In 0.3.4 the verify window runs through `kernels/qwen/dense/v1/row_forward.py`, the lane decoder without tensor
-units: the lane glue, stacked projections and the lane recurrence, with every matmul through
-`kernels/qwen/dense/v1/simd_qmm.py`. That kernel dequantizes each 8x8 weight tile once and multiplies up to 16
-rows with the simdgroup matrix units every Apple GPU has, so a row's bits never depend on how many rows ride
-with it. Serial decoding, windows and prompts all go through it. Window costs on the M3 Ultra: 1 row 25.0 ms,
-2 to 8 rows about 32 ms, 9 to 16 rows about 53 ms. Prompts resume only from a 2,048-token grid
-(`TF_ROW_PREFILL=aligned`, the default), so a resumed conversation equals a fresh one at MLX's prompt speed.
-`TF_ROW_MATMUL=row_qmv` restores 0.3.3's matvec.
-
-In 0.3.3, window costs there were 1 row 26.7 ms, 2 rows 34.8, 4 rows 53.7, 8 rows 101.9. Every drafted reply
-equaled the same request with `"draft": false` (9 of 9), and replies resumed from different cached amounts
-were identical. On an M5 Max with the lane kernels forced off (`--lane-kernels off`, MLX 0.31.2) the same path
-gave 49.1 / 39.6 / 48.9 / 40.5 against about 31 tok/s serial. With the lane kernels on, the M5 Max numbers
-are unchanged (168.4 / 69.3 / 154.7 / 73.5 against 0.3.2's 169.2 / 70.2 / 156.4 / 74.2 in the same session).
-
-Each extra window row costs about a third of a one-row step here, which caps the gain; a row-exact matmul on
-the simdgroup matrix units that every Apple GPU has is the next step.
-
-## Exactness
-
-- Lane matmul arithmetic: for each 64-input group the tensor op multiplies the bf16 rows by the raw 4-bit
-  weights into fp32; each output adds scale times that product plus bias times the fp32 sum of the group's
-  inputs, groups in order. K splits into a fixed number of slices chosen from the weight shape alone. A
-  column's bits depend only on K and the slice count, so projections that share an input stack into one call
-  (`kernels/lane_fuse.py`).
-- Lane attention arithmetic is fixed by absolute key position: 512-key chunks, 64-key tiles, 16-row tiles of
-  query-head rows, fp32 online softmax, chunks merged in order.
-- Rollback to exactly the kept prefix: attention layers are trimmed, and each DeltaNet layer re-runs its
-  recurrence over the kept tokens from the recorded start state (`kernels/gdn_capture.py`).
-- Trees: per-row RoPE positions, each node attending to the committed keys and its own path, the recurrence
-  visiting nodes in row order one step from the parent's state (`kernels/lane_tree.py`).
-- Tests: rows of any call equal the same rows alone at every projection shape; attention window rows equal
-  single queries; tree nodes equal serial steps along their paths; a 16-token window through all 64 layers
-  equals 16 single steps bit for bit; end to end, drafted replies equal `"draft": false` replies byte for
-  byte.
-- Traps: the tensor op is exact only up to 128 output columns. Its destination fragment layout depends on the
-  operand types, and assuming the wrong one looked exactly like "half-precision P breaks row independence". The
-  chat template's highest reasoning effort writes into the system prompt, so no system-block snapshot matched;
-  medium writes nothing.
-
-## Next
-
-- More tokens a round: a drafter distilled at scale from the target's own tokens (top-32 logits per token),
-  gated at 6.5 tokens a round offline.
-- Cheaper rounds: hide drafting behind verification (6-9 ms a round), attention toward its tensor-op ceiling
-  (the biggest win at 40-70k context), matmuls toward 90% of bandwidth.
-
-## DGX Spark (CUDA)
-
-The CUDA engine (`src/tensorfold/families/qwen3_5/cuda/`, kernels listed in its README) reads the same
-`Vontra/Qwen3.8-27B-MLX-4bit` checkpoint and drafts with the same `z-lab/Qwen3.8-27B-DFlash2`. Measured on
-DGX Spark (GB10, 128 GB unified memory, about 240 GB/s measured read) in NVIDIA's `pytorch:26.07-py3` container, one
-Spark and two Sparks linked by their 200 Gb/s ports.
+The native engine serves `TensorFold/Qwen3.8-27B-MLX-4bit` on Metal, qualified on M5 Max and M3 Ultra, from
+`zig/src/families/qwen27/`. It drafts with DFlash2 (`zig/src/families/qwen27/dflash/`) only when `--drafter` names
+the drafter; without it the model decodes plain. On CUDA the native engine serves the MLX affine checkpoints (2, 3,
+4, 5, 6 and 8 bits in groups of 64) from `zig/src/families/qwen3_5/cuda_*.zig`, with DFlash2 drafts and
+`--kv-cache fp8`. It also reads ModelOpt NVFP4 and FP8 exports, and turboderp's EXL3 packs (`mul1` codebook) with
+DFlash2 drafts through the shared EXL3 module, on one GPU.
 
 ```bash
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0 --port 8080
-# two Sparks, the same command on each (rank 1 first); rank 0 serves HTTP
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 1 --master 192.0.2.1
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.0.2.1 --host 0.0.0.0 --port 8080
+tensorfold pull TensorFold/Qwen3.8-27B-MLX-4bit
+tensorfold pull z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --drafter z-lab/Qwen3.8-27B-DFlash2 --name bench
 ```
 
-Pull both checkpoints first on every Spark (`tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit
-z-lab/Qwen3.8-27B-DFlash2`): with two Sparks both ranks draft, each with half the draft model. The ranks check
-at start that they were given the same settings.
+A lone Metal DFlash2 stream can verify 16, 32 or 64 rows (`TF_QWEN27_WINDOW`), on tensor units and earlier chips.
+Both device classes retain the 16-row default. Startup prices every row count through
+the selected width, in a width-tagged cache.
+Tensor-unit servers with several slots also measure wider unfused row shapes, through 64 rows when the context fits.
+Shared allocation uses those prices beyond the lone window; the lone window retains its own measured prices.
+Shared DFlash2 proposals use the allocator's grants before their batched pass, on both projection paths.
+Lone, cost-pruned trees keep their learned landing counts; shared requests and their tails use the node log-probability prior.
+Wide tensor-unit windows enable context copies by default; earlier chips keep copies opt-in.
+A lone lane request may propose up to 15/31/63 tree nodes at 16/32/64 rows, including the drafter's next-most-likely siblings at each depth. It chooses a parent-closed prefix
+by expected accepted tokens per measured millisecond in the common lane allocator, using its calibrated landing rates.
+The proposal keeps every candidate available until that decision. Copies compete for the same verification window;
+`TF_QWEN27_COPIES=0` disables them. The narrow tensor-unit default keeps copies off.
+The masked drafter block is unchanged. Both device classes use the lane loop by default, including at 16 rows.
+`TF_QWEN27_LANES=0` selects the legacy greedy shortcut; sampled requests retain the shared lane loop.
+Startup names the selected lone loop and width beside the lane window and copy policy.
+`tf-qwen27-bench --model DIR --widths costs` measures rows 1 through 64, with GPU and wall time including keep.
+The wall price excludes the diagnostic's host logit hash and scan.
 
-### Against vLLM with MTP
+A greedy single-window lane pass gathers its matching taps with its target picks
+in the final verify command buffer. The lane core still chooses
+its authoritative keep. A matching prefix publishes its cache keep behind the next drafter frame; other paths
+keep synchronously. Target-state users drain outstanding keeps before verification, prefill, release or reset.
+The completed shared logit row is restored by an exact host word copy on that prefetched path.
+The cache keep is encoded while the target verify runs, using its existing plans. It remains uncommitted until
+the lane core supplies the authoritative path. Failure or a changed path drops the unused prepared buffer.
+Selector scratch is bounded on the stack; only the three owned result arrays allocate. A full tree that loses
+weak nodes during common pricing can offer context copies into the freed rows and price them once more.
+Drafter scratch reserves 64 KiB chunks, so small context growth reuses its existing buffers.
+On a single-slot server, a lone greedy lane starts its next draft at the following host step. Its target keep
+can finish while the host publishes the current reply chunk, as in the serial loop. The saved request owns
+its row indices and following tokens, and release or handoff cancels it. Shared, sampled and structured
+requests retain their existing scheduling.
 
-Decode tokens per second after the first token, one stream, 64-token replies, median of 5 seeds (1234 to
-1238), through the same OpenAI client (`tools/bench_openai.py`) for both engines, with this release installed by pip and started by `tensorfold serve`. Code prompt: "Write a short
-Python function that computes the Fibonacci sequence and explain it." as a raw completion. Chat prompt:
-"Explain how matrix multiplication uses a GPU in plain English, then give a small numerical example." through
-the chat template with thinking off. Sampled means temperature 1, top-k 20, top-p 0.95.
+`TF_Q27_PASS_PROFILE=1` records host phases, GPU spans, command-buffer waits and commits, and forwarding-allocator
+calls on the serving thread. The `q27_offer` and `q27_keep` lines show verified tree and copy rows and the kept path.
+It preserves command boundaries. Leave it unset for throughput measurements.
 
-| | Code, sampled | Chat, sampled | Code, greedy | Chat, greedy |
+The legacy lone shortcut handles greedy requests; sampled requests use the shared lane loop.
+For bounded top-k requests, the BF16 host draw validates and selects candidates in one scan, using owned stack
+scratch. The same FP64 keyed sampler applies temperature, top-p and min-p to the same ordered candidates.
+Larger or unbounded cuts keep the general draw. Sampling time has its own pass-profile phase.
+
+On Metal, M5 prompt passes request 2,048 rows when no other request is decoding; earlier chips keep the 512-row
+default. The larger frame must fit the configured context and all streams beside loaded weights and the 8 GiB
+margin, otherwise M5 keeps 512 rows. Startup reserves the actual prompt scratch sizes as well as stream caches.
+Wide prompt frames keep separate 512-row activation scratch for small rounds, so decoding binds the small buffers.
+Admission counts both banks.
+`TF_QWEN27_WORKING_SET_BYTES` can lower the device working-set budget for admission checks. `TF_PROMPT_ROWS` selects another multiple of 16 from 16 to 2,048. Each chunk takes at most 512 rows beside
+a decoding request, including with an override, and still respects the frame, attention and request boundaries.
+
+Measured on an M5 Ultra (macOS 27) through the served API against mlx-lm 0.32.0 on the same checkpoint, raw prompts
+from this repository's docs, 100 greedy tokens, prefill from the time to the first token:
+
+| Prompt | Native prefill tok/s | mlx-lm prefill | Native decode tok/s | mlx-lm decode | Native with DFlash2 |
+|---|---|---|---|---|---|
+| 2k | 1325 | 1216 | 51.6 | 54.7 | 162-226 |
+| 8k | 1269 | 1860 | 49.4 | 52.8 | 102 |
+| 32k | 1171 | 1699 | 46.2 | 46.5 | 120 |
+
+A plain one-row round is 19.5 ms on the M5 Ultra (`tf-qwen27-bench`, `QWEN27_ADVANCE`): its 321 projections read
+14.1 GB in 16.2 ms, each shape at the K split it streams fastest at over every layer's matrix (`QWEN27_DISTINCT`;
+a matrix called again sits in the system cache and misleads), and an undrafted one-row window is kept by its own
+verify, as a prompt's rows are, rather than by a keep command buffer the host waited on (1.1 ms a token). Decode
+attention scores each row's keys in 128-key chunks while the row's position is below 8,192 and 512-key chunks
+from it (`attention_plan.chunkFor`, the chunk a row's node carries): at a 2k context a row's four key heads
+were eight threadgroups of 512 keys on an 80-core GPU, 96 µs a layer. A row's chunks follow its own position, so
+it merges the same partials as its one-row step in a chain, a tree, a window across 8,192 or beside other streams,
+and drafted rows stay byte-equal to plain ones. A one-row round's
+DeltaNet step is three dispatches a layer rather than five: `tf_delta_gdn_pre_step` writes each slot's next conv
+window into its history as it reads it, so the commit and publication kernels go, and spreads a 128-wide head over
+four simdgroups (each lane's squares still summed in order); 1.19 ms a token where 1.75 (`QWEN27_STEPCHECK` checks
+the state, history and logits bytes against the general path).
+
+The rest of this page describes the Python engine, frozen at 0.6.6 and available at the
+[`v0.6.6` tag](https://github.com/ashhart/TensorFold/tree/v0.6.6). Its flags, commands and paths belong to that
+engine. @nood-co1, @jkuepker and @Arminova worked on its CUDA path; see [credits](../credits.md).
+
+Experimental [packed affine formats](../quantization.md) include 8-bit and mixed layer precision.
+
+The `qwen3_5` family combines Gated DeltaNet and full attention. The standard recipe below uses its
+4-bit/group-64 checkpoint; the quantization guide lists the other affine formats it reads.
+
+```bash
+tensorfold pull TensorFold/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --name bench
+```
+
+DFlash2 is used automatically once pulled. On MLX, `--drafter none` disables that draft model;
+`--no-drafts` disables all drafts on either backend. CUDA requires DFlash2 unless `--no-drafts` is set.
+The HIP engine runs no DFlash2 drafter yet: `serve --drafter` is refused before the engine opens the GPU or
+loads any weights. Refusing DFlash2 does not turn off the engine's own drafts: the model's MTP head where the
+checkpoint has one, and copies from the stream's own context. `TensorFold/Qwen3.8-27B-MLX-4bit` has no MTP
+head, so on HIP it drafts copies only. `--mtp-drafts 0` stops the MTP head's drafts alone; `--no-drafts` turns
+both off and decodes plain.
+The target verifies every proposed token against its own serial sample.
+
+## MLX
+
+M5 tensor-unit GPUs run the lane decoder with draft trees. M1 through M4 use `row_forward` and the
+packed row decoder with windows of up to 16 rows by default. Its existing 4-bit formats use `simd_qmm`,
+and other supported affine formats use the general packed kernel. Both paths use the same arithmetic for serial
+and drafted calls. Load-time checks determine usable window widths and shared-forward support.
+
+The engine can share a round across requests while keeping each stream's attention, recurrent state and
+sampling independent. DeltaNet commits replay the accepted path; attention commits retain only its keys.
+Prompt chunks start at detected assistant-message boundaries and the second message when these are at
+least 256 tokens beyond the previous chunk start, or after 2,048 tokens if no earlier boundary qualifies.
+Prefix reuse resumes only at these chunk starts, so a follow-up can reuse the state before its previous
+reply. The plan comes from rendered tokens; a template without detected markers uses 2,048-token chunks.
+
+On the native pre-M5 lane loop, `TF_QWEN27_WINDOW=32` or `64` requests an experimental wider window and
+`TF_QWEN27_COPIES=1` enables lane context copies. Defaults remain 16 and copies off until served qualification.
+`TF_QWEN27_LANES=0` selects the legacy lone serial loop; its 16-row width and copy policy remain independent of
+those lane switches. Startup logs the effective lone loop and width beside the configured lane window and copies.
+The lane switch accepts only 0 or 1; the copy switch accepts only 0 or 1. Invalid settings name their variable.
+
+## Weights other than 4-bit
+
+The M5 lane kernels accept MLX affine 2-, 3-, 4-, 5-, 6- and 8-bit projections in groups of 64.
+They widen packed values for the tensor operations without changing those values. Mixed-width stacks
+keep separate calls where a fused projection needs one width. Examples include
+`TensorFold/Qwen3.8-27B-oQ2` and `TensorFold/Qwen3.8-27B-oQ4`.
+
+The packed row readers on Apple Silicon and the CUDA readers cover MLX affine 2/3/4/5/6/8-bit projections
+with groups of 32/64/128, including mixed layers. CUDA also reads [EXL3 packs](#exl3-checkpoints-experimental).
+A fused projection keeps its members separate where their bit width or group size differs. Unsupported formats
+and tied embedding heads are refused from `config.json` before weight downloads and again at load; loaded
+projections must also be covered by the selected decoder. `--lane-kernels on` requires M5 tensor units and
+formats they read; `auto` falls back to the packed row decoder for the rest.
+Lower weight precision does not guarantee faster decode or a fitting context. Release memory and
+quality comparisons are TBD [release-0.3.5].
+
+## CUDA
+
+This section is the Python engine's (0.6.6). The native CUDA engine reads the MLX affine checkpoints, ModelOpt
+NVFP4 and FP8 exports, and turboderp's EXL3 packs through the shared EXL3 module of #832; its own measurements are
+not the ones below.
+
+On CUDA the 27B serves NVFP4 and EXL3 checkpoints, and the MLX 4-bit checkpoint as the portable option: the same
+files a Mac serves, and the only format two ranks read. `tensorfold serve` loads the checkpoint you name; it picks
+none by itself. Use the [CUDA container setup](https://github.com/ashhart/TensorFold/blob/v0.6.6/RUNBOOK.md#nvidia-gpus)
+for any of them. Prompts take bf16
+activations by default; what that costs against the FP8 prompt path (`--prefill-fp8`) depends on the format
+([prompt precision](cuda.md#prompt-precision)):
+
+| Checkpoint | Weights | Ranks | bf16 prompts against `--prefill-fp8` |
+| --- | --- | --- | --- |
+| `nvidia/Qwen3.8-27B-NVFP4` | NVFP4 MLP and head, FP8 attention and DeltaNet | one | not measured yet |
+| `turboderp/Qwen3.8-27B-exl3` (3.00bpw) | EXL3 | one | unchanged: EXL3 prompts never took FP8 activations |
+| `TensorFold/Qwen3.8-27B-MLX-4bit` | MLX affine 4-bit, groups of 64 | one or two | 0.73-0.82x from 2k to 128k |
+
+Mia-AiLab publishes EXL3 packs of the model (`Mia-AiLab/Qwen3.8-27B-EXL3`, `Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw`,
+`Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`) and an EXL3 DFlash2 drafter (`Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw`); none
+has been loaded here yet.
+
+### NVFP4 checkpoints
+
+The CUDA engine reads NVIDIA's ModelOpt export of the model (`nvidia/Qwen3.8-27B-NVFP4`: NVFP4 MLP and head, FP8
+attention and DeltaNet projections, bf16 embedding and gates) as it ships. The reader also takes
+compressed-tensors NVFP4 and FP8 exports, checked on synthetic tensors only. Each projection is read by its tensors: NVFP4 codes with their e4m3 block scales and
+FP8 bytes go to the device unchanged, and the lane matmuls turn them into exact bf16 operands (an e2m1 code times
+its block scale fits bf16), so drafted replies equal `"draft": false` ones and prompts keep their bits in any
+chunking. `--parallel` serves concurrent requests as on the MLX checkpoint, each reply equal to the same request
+alone. One GPU: `--tp 2` stops at startup (two ranks read the MLX checkpoint), and so does `--vision` until image
+input is qualified on this checkpoint.
+
+```bash
+tensorfold pull nvidia/Qwen3.8-27B-NVFP4 z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve nvidia/Qwen3.8-27B-NVFP4 --host 0.0.0.0 --port 8080
+```
+
+Prompts take bf16 rows on a prompt GEMM that reads the stored bytes: each FP8 byte and each NVFP4 code times its
+block scale is exact in bf16, summed in fp32 over the inputs, the tensor scale last. `--prefill-fp8` restores the FP8
+prompt matmul (FP8 projections as stored, NVFP4 ones staged to e4m3 once a chunk, a step that rounds by 2^-4 at most,
+and e4m3 activations). Decode, measured on one DGX Spark (GB10) through `tensorfold serve` against the MLX 4-bit
+checkpoint on the same engine and box, alternating (MLX, NVFP4, NVFP4, MLX), 64 tokens, five seeds, medians:
+
+| Cell | NVFP4 | MLX 4-bit | vLLM MTP=3 (NVFP4) |
+| --- | ---: | ---: | ---: |
+| Code, sampled | 47.1 tok/s | 57.8 tok/s | 23.4 tok/s |
+| Chat, sampled | 38.2 tok/s | 50.0 tok/s | 25.4 tok/s |
+| Code, greedy | 47.2 tok/s | 53.9 tok/s | 25.8 tok/s |
+| Chat, greedy | 38.3 tok/s | 50.1 tok/s | 24.7 tok/s |
+
+The table predates a fix to the FP8 lane matmul (its pipeline stages now start on 128-byte lines), which took a
+12-row verify from 103 ms to 85 against the MLX checkpoint's 84, although the attention and DeltaNet weights are 8-bit
+(16.3 GB read a token against 14.4). Tokens a round match (4.0-5.2). Cold prefill ran 1,834 / 1,872 / 1,779 / 1,563 /
+1,240 tok/s at 2k / 8k / 16k / 32k / 64k on the FP8 prompt path (today's `--prefill-fp8`), level with the MLX
+checkpoint's. The startup estimate is 62.5 GiB at the 262,144-token window.
+
+### EXL3 checkpoints (experimental)
+
+The CUDA engine also reads turboderp's EXL3 packs of the model (`turboderp/Qwen3.8-27B-exl3`, a branch per size,
+`mul1` codebook, 6-bit head) through the shared EXL3 module ([EXL3 weights](exl3.md)) and drafts with
+`z-lab/Qwen3.8-27B-DFlash2`. One GPU: two ranks read the MLX checkpoint. Download a size by its branch, then
+serve the folder:
+
+```bash
+python -c "from huggingface_hub import snapshot_download as d; d('turboderp/Qwen3.8-27B-exl3', revision='3.00bpw', local_dir='qwen27b-exl3-3.00bpw')"
+tensorfold pull z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve qwen27b-exl3-3.00bpw --host 0.0.0.0 --port 8080
+```
+
+Verify windows use the row-invariant EXL3 linear, so drafted replies equal `"draft": false` ones; prompts use the
+EXL3 prompt path (W_q decoded once a chunk, a fixed-tile GEMM), whose bits do not depend on chunking, so the
+engine keeps prompt ends as it does for the MLX checkpoint. The drafter reads the target's 6-bit head over its
+draft vocabulary by slicing the head's 128-column strips as stored: its logits are the target's, bit for bit.
+
+Measured on one DGX Spark (GB10) through `tensorfold serve`, the 3.00bpw pack against the MLX 4-bit checkpoint on
+the same engine and box, the [public benchmark command](README.md#measurements), medians of 15 runs a cell:
+
+| Cell | EXL3 3.00bpw | MLX 4-bit | vLLM MTP=3 |
+| --- | ---: | ---: | ---: |
+| Code, sampled | 83.4 tok/s | 57.5 tok/s | 23.4 tok/s |
+| Chat, sampled | 44.2 tok/s | 49.7 tok/s | 25.4 tok/s |
+| Code, greedy | 64.5 tok/s | 53.6 tok/s | 25.8 tok/s |
+| Chat, greedy | 39.9 tok/s | 50.0 tok/s | 24.7 tok/s |
+
+A 12-row round costs 75 ms on the pack against 84 on the MLX checkpoint (10.1 GB of weights a token against
+14.4). The chat cells keep fewer drafted tokens a round (3.0-3.3 against 4.2), since DFlash2 was trained on the
+unquantized model. Cold prefill runs 880-970 tok/s from 2k to 16k and 720-890 at 32k-64k, about two thirds of the
+MLX checkpoint's bf16 prompts and half its `--prefill-fp8` ones. The engine and drafter take 13.2 GiB after loading;
+a 64k prompt peaks at 28 GiB allocated. Other branches of the pack load through the same path; only 3.00bpw is
+measured here.
+
+### MLX 4-bit, one or two ranks
+
+One or two ranks are supported. Pull the model and drafter on every rank, then start rank 1 before rank 0:
+
+```bash
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --tp 2 --rank 1 --master 192.0.2.1
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.0.2.1 --name bench --host 0.0.0.0
+```
+
+The verify matmul fixes reduction order by weight shape. Tree attention reads only committed keys and the
+node's own path; recurrent commits replay that path. Two-rank reductions gather fp32 partials and add in
+rank order. Each rank count has its own serial reference. See the
+[CUDA kernel map](https://github.com/ashhart/TensorFold/blob/v0.6.6/src/tensorfold/families/qwen3_5/cuda/README.md).
+
+### Concurrent requests
+
+```bash
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --parallel 16 --context 8192 --name bench
+```
+
+`--parallel N` decodes up to N requests in shared rounds: each stream verifies its own DFlash2 tree in one
+forward, and every reply equals the same request served alone. A new prompt prefills 1,024 tokens a round
+while the other streams decode. States kept at message starts let prompts that share a system prompt resume
+there, and each stream's caches are sized once, at admission.
+
+On one DGX Spark, with the workload from issue #38 (48 chat requests of 3,000 to 5,100 tokens sharing a
+2,900-token system prompt, up to 512 tokens each, greedy, all sent at once), TensorFold serves 161.7 tok/s at
+16 in flight with a 25.4 GiB peak (nvidia-smi). vLLM with `nvidia/Qwen3.8-27B-NVFP4`, MTP=3, prefix caching
+and `--max-num-seqs 16` serves 132.1 tok/s at 51.7 GiB on the same Spark. At 8 and 4 in flight TensorFold
+serves 147.5 and 112.0 tok/s.
+[`tools/shared_prefix_prompts.py`](https://github.com/ashhart/TensorFold/blob/v0.6.6/tools/shared_prefix_prompts.py)
+(at the `v0.6.6` tag) builds the workload and
+`tools/shared_prefix_load.py` sends it (`--concurrency`, `--mem` for the memory peak).
+
+### Structured output
+
+With `pip install 'tensorfold[grammar]'` (xgrammar), serving on one or two GPUs enforces `response_format` and the
+`guided_*` fields: drafts the grammar rejects are cut and rows are masked by their paths' grammar before sampling, so
+drafted, serial and concurrent replies stay equal. See [the API reference](../api.md#structured-output).
+
+### Historical public-fixture results
+
+The earlier CUDA recipe reports these decode medians in NVIDIA's `pytorch:26.07-py3` container on GB10.
+They are retained as historical results, not measurements of the merged 0.3.5 release.
+
+| Ranks | Code sampled | Chat sampled | Code greedy | Chat greedy |
 | --- | ---: | ---: | ---: | ---: |
-| vLLM, MTP=3, one Spark | 17.7 | 15.0 | 17.7 | 17.0 |
-| TensorFold, one Spark | **49.6** | **45.8** | **49.2** | **45.9** |
-| ratio | 2.80x | 3.05x | 2.78x | 2.70x |
-| vLLM, MTP=3, two Sparks (TP2) | 33.1 | 30.4 | 31.6 | 30.5 |
-| TensorFold, two Sparks | **82.4** | **58.9** | **76.2** | **71.1** |
-| ratio | 2.49x | 1.94x | 2.41x | 2.33x |
+| One | 49.6 tok/s | 45.8 tok/s | 49.2 tok/s | 45.9 tok/s |
+| Two | 82.4 tok/s | 58.9 tok/s | 76.2 tok/s | 71.1 tok/s |
 
-vLLM ran NVIDIA's NVFP4 ModelOpt quantization of the same model (NVFP4 weights, FP8 DeltaNet projections and
-KV cache, 22.1 GiB) with `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'
---max-model-len 32768 --max-num-seqs 16 --enable-prefix-caching --enable-chunked-prefill
---attention-backend TRITON_ATTN`, and across two Sparks `--tensor-parallel-size 2 --nnodes 2`. Without drafts
-it decodes 10.5 tok/s on one Spark; with its own DFlash2 support at 7 drafts, 28.3 and 22.9. vLLM's drafted
-output is not byte-identical to its serial output. Ours is: every run compares the drafted token ids with
-serial decoding on the same engine by SHA-256.
+Reproduce the workload with the checkpoint above, default drafting and the
+[public benchmark command](README.md#measurements). Its fixed prompts, 64-token replies, seeds 1234
+through 1238 and sampling settings define these cells. For one rank, omit the tensor-parallel flags. Record the runtime
+and model revision with any new result; these historical rates are not predictions for another runtime.
 
-Serial decoding runs 13.1 tok/s on one Spark and 22.5 on two. Single seeds vary a lot for both engines (ours
-on two Sparks, code: 70.0 to 135.6 tok/s over the five seeds), which is why the table uses medians.
+### A 64 GB M5 Pro on 0.3.5.1
 
-### What paid on CUDA
+@benwilson measured these on real 64 GB hardware for issue #70. They describe TensorFold 0.3.5.1, not a later
+release; the issue's first comment has the archive of logs, request bodies and the fixture builder.
 
-| Step | Effect |
+| | |
 | --- | --- |
-| A row-invariant 4-bit lane matmul in Triton: per 64-input group a tensor-core dot, then scale and bias, groups in order, the K split fixed by the weight's shape | exact windows of 1 to 128 rows; the arithmetic of the Metal lane matmul with CUDA's own bits |
-| The 4-bit words regrouped once at load into contiguous blocks per program and group, scales group-major (same bits) | weights stream at 200-220 GB/s instead of 107-130; one-row forward 123 to 75 ms |
-| DFlash2's projections at 4 bits through the same matmul, the context's keys and values cached per layer | drafting 19.5 to 9.6 ms a round, same acceptance |
-| DFlash2 on fused kernels (stacked q/k/v, Triton dynamic convolution and norm plus rotary, one mask and rotary table a round): 918 to 288 kernels | drafting 9.4 to 7.4 ms a round |
-| Commits write the accepted rows in place; one launch replays every DeltaNet layer's accepted path | no cache copies at long context; 3.6 to 2.3 ms a round on two Sparks before the one-launch replay |
-| Two Sparks: tensor parallel with fp32 partial sums gathered and added in rank order, the head split by vocabulary, the drafter split over both ranks | two-Spark code 89.2 to 95.3, chat 69.8 to 75.3 tok/s on the engine bench |
-| 12-row windows | the same drafts accepted as at 16 rows on these prompts, about 3 ms less a round |
+| Machine | MacBook Pro Mac17,9, Apple M5 Pro, 20-core GPU, 64 GB, macOS 26.5.2 (25F84), on AC power |
+| Budget | 44.8 GiB: 70% of 64 GB, under the 55 GiB Metal working set (`iogpu.wired_limit_mb=56320`) |
+| Runtime | TensorFold 0.3.5.1 (`beddbb7`, from the tag), Python 3.12.13, mlx and mlx-metal 0.31.2, mlx-lm 0.31.3 |
+| Checkpoints | `TensorFold/Qwen3.8-27B-MLX-4bit@70ae7fac`, `z-lab/Qwen3.8-27B-DFlash2@50307d4c`, `TensorFold/Qwen3.8-27B-oQ2@8cf0a7da` |
+| Launch | `tensorfold serve <model> --name bench`, plus `--drafter none` or `--no-drafts` where named |
+| Peak memory | `ri_lifetime_max_phys_footprint` from `proc_pid_rusage` |
 
-### Tried and rejected on CUDA
+| Configuration | Fitted context | Peak footprint | Workload that set the peak |
+| --- | ---: | ---: | --- |
+| Qwen3.8-27B + DFlash2 | 140,288 | 43.69 GiB | prompts up to 139,922 tokens, cold and resumed |
+| Qwen3.8-27B, `--drafter none` | 152,576 | 39.87 GiB | a 152,210-token prompt, cold and resumed |
+| Qwen3.8-27B-oQ2 + DFlash2 | 172,032 | 43.81 GiB | a 171,667-token prompt, cold and resumed |
 
-- Per-shape matmul settings picked from isolated sweeps: 3-8% faster alone, 1.5-2 ms slower per forward in
-  the whole model.
-- `NCCL_PROTO=LL` for the 128 all-gathers of a two-Spark forward: 16-row forwards went from 52.6 to 82.0 ms.
-- Stacking the DeltaNet gate projections into one matmul: no gain at 16 rows.
-- Wider trees: 32-64 rows accept about one more token a round but add 30-40 ms of verification, so 12 rows
-  stays fastest (49.2 tok/s against 44.7 at 32 rows and 43.7 at 64 in a 256-token sweep).
-- Longer DFlash2 blocks (26 or 32 positions, the checkpoint was trained on 8): fewer accepted tokens than
-  block 16 at the same width, 5.8 against 6.2 a round at 32 rows.
-- More of the target's sampling noise in the tree scores (weight 1.0 instead of 0.7): fewer tokens a round.
+Long prompts used the source of `ggml-org/llama.cpp@90c26fcd` (`src/*.cpp`, then `ggml/src/*.c*`, sorted),
+tokenized by the served model and cut to N tokens behind a nonce line. Replies were 64 tokens, greedy, with
+`ignore_eos` and thinking off; the resumed request adds one assistant and one user turn.
 
-### Where the time goes
+| Rendered prompt | Cold TTFT | Prefill | Decode at depth | Resumed: cached, TTFT |
+| ---: | ---: | ---: | ---: | --- |
+| 8,224 | 19.5 s | 423 tok/s | 25.5 tok/s | 8,192, 0.25 s |
+| 16,417 | 41.0 s | 401 tok/s | 29.8 tok/s | 16,384, 0.31 s |
+| 32,800 | 90.5 s | 363 tok/s | 24.4 tok/s | 32,768, 0.37 s |
+| 65,569 | 221.6 s | 296 tok/s | 20.5 tok/s | 65,536, 0.61 s |
+| 98,337 | 395.1 s | 249 tok/s | 15.8 tok/s | 98,304, 0.69 s |
+| 131,106 | 578.4 s | 227 tok/s | 15.7 tok/s | 0, 574 s (#71) |
+| 139,922 | 640.5 s | 219 tok/s | 16.3 tok/s | 0, 644 s (#71) |
 
-On one Spark a 12-row round takes about 95 ms: 83 ms verifying (the weights stream near the read limit), 8 ms
-drafting, under 1 ms committing. On two Sparks it takes about 60 ms: 52 ms verifying (each rank's 4-bit
-matmuls about 42 ms at about 175 GB/s on half-size shards; the 128 all-gathers and the small kernels the
-rest), 6 ms drafting, 2 ms committing. Half of the 12-row rounds end because every draft on the accepted branch was right
-and the tree had nothing deeper, and at two thirds of the misses the right token was among the drafter's
-16 candidates for that position: a tree that spends its rows on depth before siblings is the next thing to
-try.
+Decode medians from the [public benchmark command](README.md#measurements), in tok/s for code sampled, chat
+sampled, code greedy and chat greedy: 62.8, 45.9, 61.2 and 56.2 with DFlash2; 16.6, 16.1, 16.2 and 16.3 with
+`--no-drafts`; 16.2, 16.2, 16.6 and 16.4 with `--drafter none`; 41.8, 37.2, 92.1 and 47.9 for oQ2 with DFlash2.
+`tools/bench_concurrent.py --alone --serial` at 1, 2, 4 and 8 streams found all 180 concurrent replies equal to
+their solo runs and every solo run equal to `"draft": false` (60 of 60 for oQ2 at 1 and 4). Code greedy served
+78.9, 117.7, 158.2 and 201.4 tok/s in aggregate at 1, 2, 4 and 8 streams. The release checks (drafted against
+serial, resumed against fresh, by `token_sha`) matched on 8 of 8 short-prompt cells and 4 of 4 cells at 8,192
+tokens with a real resume, and replays after a restart matched too. A conversation grown by 6,144 tokens a turn
+to the 140,288 window kept swap at 653 to 656 MB, with a 43.57 GiB peak footprint.
 
+### A 48 GB M5 Pro Mac mini on 1.2.1
+
+Halfpenny Mac measured these on a rack-mounted Mac mini with the release binary; the 1.1.0 runs of the same cells
+are [public receipts](https://tensorfold.dev/benchmarks?contributor=7cc22071-45c2-4df0-8466-2cc25904b4fe) on the
+board.
+
+| | |
+| --- | --- |
+| Machine | Mac mini Mac17,16, Apple M5 Pro, 15-core CPU, 16-core GPU, 48 GB, macOS 27.0.1 (26A434), headless |
+| Runtime | TensorFold 1.2.1, the native Metal binary from Homebrew (`ashhart/tensorfold/tensorfold`), no Python |
+| Checkpoints | `TensorFold/Qwen3.8-27B-MLX-4bit@22d8d538`, `z-lab/Qwen3.8-27B-DFlash2@50307d4c` |
+| Launch | `tensorfold benchmark TensorFold/Qwen3.8-27B-MLX-4bit`, managed server, defaults; `--serial` for the plain rows |
+
+Decode medians from the [public benchmark command](README.md#measurements), 256-token replies, five repeats a cell,
+in tok/s for code sampled, chat sampled, code greedy and chat greedy: 89.1, 47.2, 79.3 and 56.4 with DFlash2;
+17.3, 17.3, 17.3 and 17.3 with `--serial`. First text arrived in 71 to 73 ms on every cell. The 1.1.0 binary served
+86.5, 46.1, 80.2 and 53.3 on the same cells. The machine was otherwise idle and no wired-limit sysctl was set.
+
+## Calibration and checks
+
+The draft calibration metadata names public prompts. When regenerating it, start its server with
+`--port 8473 --name qwen27` so the collection client reaches the named endpoint. Pass the saved full
+provenance object with `--source` to
+[`tools/fit_draft_calibration.py`](https://github.com/ashhart/TensorFold/blob/v0.6.6/tools/fit_draft_calibration.py)
+(at the `v0.6.6` tag); retain model and drafter revisions.
+
+Kernel tests check rows alone and in windows, tree paths and committed state. Release checks must also
+compare drafted/serial, resumed/fresh and concurrent/solo requests with thinking on and off and tools.
+Decode rate, prefill, concurrency and peak-memory results are TBD [release-0.3.5].
+
+### Long-document prompt reuse
+
+The lane cache can keep one additional state inside a final user message of at least 8,192 tokens. It leaves
+at least 2,048 tokens outside the snapshot key for a different question following the same document. Qwen27
+Metal chooses an existing request chunk start, so the optional prompt bank and its fallback both already
+cut there. A direct caller supplying no chunk starts skips this optional state instead of guessing a cut.
+Endpoint, rewind and shared states have priority within the same byte and slot caps. Retained-state occupancy
+is published in `tensorfold:prompt_cache_states` and `tensorfold:prompt_cache_bytes`; restored tokens also count
+in `tensorfold:prompt_tokens_cached_total`. Synthetic host checks cover the two-request pattern and exact
+output. Real-model parity and TTFT for this state still need the Metal gate.

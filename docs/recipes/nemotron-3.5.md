@@ -1,99 +1,234 @@
-# Nemotron 3.5 Lightning 30B-A3B (`nemotron_h`)
+# Nemotron 3.5 Lightning
 
-Measured on an M5 Max with 128 GB and MLX 0.31.2, with the 4-bit checkpoint. Package:
-`src/tensorfold/families/nemotron_h/`.
+The model combines Mamba-2, attention and MoE blocks. The native family is `zig/src/families/nemotron/`, on Metal
+and CUDA; the native prompt reuse, routed experts and shared rounds sections below describe it, and the
+[README](../../README.md#qualified-models) lists its qualified checkpoints and hardware.
 
-## What decides the speed
+The MLX execution, CUDA, draft vocabulary and measurements sections describe the Python engine,
+frozen at 0.6.6 and available at the [`v0.6.6` tag](https://github.com/ashhart/TensorFold/tree/v0.6.6). Its MLX family
+is [`src/tensorfold/families/nemotron_h/`](https://github.com/ashhart/TensorFold/tree/v0.6.6/src/tensorfold/families/nemotron_h),
+with Metal kernels in
+[`src/tensorfold/kernels/nemotron/lightning/v1/`](https://github.com/ashhart/TensorFold/tree/v0.6.6/src/tensorfold/kernels/nemotron/lightning/v1).
 
-- 52 blocks: 23 Mamba-2, 6 attention, 23 MoE. Hidden size 2,688.
-- Attention: 32 query heads over 2 KV heads, head dim 128.
-- MoE: 128 routed experts, top 6, expert width 1,856, sigmoid scores with a correction bias, plus a shared
-  expert of width 3,712 with a squared-ReLU MLP.
-- Mamba-2: 64 heads of dim 64, state size 128, 8 groups, conv kernel 4.
-- Vocabulary 131,072. 4-bit affine weights in groups of 64.
-- mlx_lm's decode step runs about 900 small kernels a token and takes 7.3 ms, while reading the weights alone
-  takes 3.7 ms. The problem here is kernel count, not bandwidth.
+## Run
 
-## What worked
+```bash
+tensorfold pull TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
+tensorfold serve TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit --name bench
+```
 
-Through the server with exact sampling (T 1.0, top-p 0.95), thinking on, tok/s:
+The checkpoint includes `mtp-4bit.safetensors`; `pull` and `serve` check that it is available.
+`--no-drafts` or request field `"draft": false` selects serial decoding. In the Python engine, MLX supports affine 4-bit
+projections and experts in groups of 32 or 64; unsupported formats are refused before weight downloads
+and checked again at load. CUDA supports the named 4-bit/group-64 checkpoint. The native engine serves the named
+checkpoint on Metal and CUDA, and NVIDIA's NVFP4 export on CUDA.
 
-| Step | Short chat | About 20k context | About 60k context |
-| --- | --- | --- | --- |
-| mlx_lm model, host sampler | 138 | | 119 |
-| fused kernels, shared expert folded into the expert tables, one stacked q/k/v matmul | 159-163 | | |
-| plus keyed sampling on the GPU, decoding one step ahead | 185-190 | | |
-| plus the Mamba B/C conv computed once per threadgroup | 185-197 | | |
-| plus 200-op command buffers and a narrower sampler candidate window | 196-205 | | |
-| plus tensor-unit attention (head dim 128) from 10k keys | 200-203 | 175 | 138 |
-| plus alternating KV buffers | 200-206 | 175 | 162 |
+On Metal the native engine also serves MLX checkpoints at a width per module (2, 3, 4, 5, 6 or 8 bits, not 7, in groups
+of 32, 64 or 128), such as `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-oQ4`, `-oQ6` and `-oQ8`, the three
+measured. A matrix at 4-bit in groups of 64 runs on the kernels above. Any other width runs on the shared row kernels in
+decode. In prompt chunks past 128 rows, dense matrices in groups of 64 run on tiled kernels and the routed experts on
+width-general gathers; dense matrices in other groups stay on the row kernels. These checkpoints carry no MTP head. Copy
+`mtp-4bit.safetensors` from the 4-bit checkpoint into the folder to draft; without it each round decodes one token. With
+the head on an M3 Ultra, greedy prose decodes at 162 tok/s with oQ4, 117 with oQ6 and 111 with oQ8, against 188 with the
+4-bit checkpoint, and prompts of 8,192 to 32,768 tokens read at 0.96x to 0.99x mlx_lm's rate on the same checkpoint; a
+server's first 2,048-token prompt after it starts reads at 0.78x to 0.90x. For MLX affine checkpoints, CUDA, the Intel
+GPU engine and `--slide` refuse widths other than 4-bit group 64 and name the first such module.
 
-The pieces (`kernels/nemotron/lightning/v1/kernels.py`):
+## MLX execution and exactness
 
-- Fused kernels between MLX's matmuls: the residual add (with the MoE combine) plus the next block's RMSNorm;
-  sigmoid routing with the correction bias to the top 6; the whole Mamba step (conv window, conv, SiLU, dt,
-  state update, D skip, SiLU(z) gate); the output RMSNorm over groups of 512. About 370 kernels a token.
-- The shared expert as two extra half-width experts with weight 1 (ids 128 and 129), so the MoE is one gather.
-  With multi-row copy windows the shared expert as its own dense branch, read once however many rows a pass
-  has, is better (drafted code rounds 201 to 216 tok/s), so that is the default.
-- Each block's work between norms compiled with `mx.compile`, one trace per row count: host time 30 to 4 us a
-  layer, same bits. The graph goes to the GPU every 8 layers.
-- Tokens drawn on the GPU and kept there. Each round queues the next forward on the new token before reading
-  it, so reading, streaming and building the next graph overlap the GPU (`engine/family_engine.py`,
-  `gpu_tokens`).
-- `MLX_MAX_OPS_PER_BUFFER=200`: MLX's default commits command buffers more often than this model's many small
-  kernels need.
-- The GPU sampler tries candidate windows of 20, 10 and 5 logit units below the row maximum and takes the
-  widest one that holds the nucleus in at most 1,024 tokens, else a radix select. Both give the same
-  candidates.
-- Tensor-unit attention for head dim 128 (`kernels/qwen/dense/v1/lane_attention.py`, shared with Qwen): the 16 query heads of one KV head form
-  one 16-row tile, so each key is read once. At 60k keys 0.323 to 0.194 ms a call, at 32k 0.191 to 0.120, but
-  slower below about 10k keys because of its extra launches, hence the switch at 10k. It needs M5 tensor
-  units and is gated by GPU generation.
-- Alternating KV buffers (`engine/alternating_kv.py`): decoding one step ahead, step s+1 wrote into a cache
-  buffer step s was still reading, so MLX copied the whole cache first, about 1 ms a token at 60k keys. Writes
-  now alternate between two buffers. Long-context decode went from 138 to 162 tok/s.
-- Quality: teacher-forced over 300 tokens against mlx_lm, top-1 agreement 0.967 and NLL 2.3523 against 2.3540.
-  mlx_lm's own prefill and decode paths agree 0.953 with each other.
-- MTP rounds. The BF16 release carries an MTP layer (an attention block and a 128-expert MoE block) that the
-  MLX conversion drops. `convert` in `families/nemotron_h/mtp.py` quantizes it from the release's last shard
-  into one 4-bit file, which the tested checkpoint ships as `mtp-4bit.safetensors`. With it, every step
-  verifies the pending token and the head's draft in one 2-row forward (or a copied continuation of up to 7
-  tokens), and the head then reads the kept rows and drafts again, queued on the GPU. In-engine on a quiet M5
-  Max: 217 tok/s on prose, 216-228 on code, 312 on an edit. Through the server, a back-to-back A/B while
-  other GPU work ran: +6-7% on prose and +9-18% on code with the head than without; edits, which copies
-  already carry, were mixed. Drafted replies are byte-identical to `"draft": false` replies. `--mtp-drafts 0`
-  (or `TF_MTP_ROUNDS=0`) turns it off.
+This section describes the Python 0.6.6 engine's MLX family.
 
-## Tried and rejected
+The lane engine verifies MTP drafts and context copies. TensorFold projections use tensor-unit kernels
+where available and row-exact kernels elsewhere. Fused routing, Mamba updates and expert kernels keep
+serial and window arithmetic consistent. Drafting depends on the load-time row check, not an MLX downgrade.
 
-- One kernel for norm, router and expert selection, where a single threadgroup reads the 0.69 MB router: 220
-  to 141 tok/s.
-- A block attention kernel that shares each key block across the 16 heads of a KV head without tensor ops:
-  correct, but 0.73 ms against MLX's 0.51 at 60k keys.
-- Heads as query rows through MLX's full attention: slower.
-- Tensor-unit attention below 10k keys, and the folded shared expert while drafting.
+Rollback retains the accepted Mamba convolution and recurrent states and trims attention caches.
+Alternating KV buffers let pipelined decode avoid overwriting state still read by the preceding step.
+The lane engine can combine requests after load-time shared-forward checks. Prompt chunks start at
+detected assistant-message boundaries and the second message at least 256 tokens after the previous
+chunk start, or after 2,048 tokens when no earlier boundary qualifies. Prefix reuse starts only at these
+cuts, so cold and resumed prompts use the same chunks; templates without markers use 2,048-token chunks.
 
-## Exactness
+## CUDA
 
-- The fused kernels take R consecutive rows in order, and a row's value depends only on its own inputs. The
-  arithmetic follows mlx_lm's (fp32 math, bf16 where mlx_lm stores bf16) but is TensorFold's own, and serial
-  decoding runs through it.
-- Projections, including the head, are MLX's quantized matmuls (strategy A in the [recipe book](README.md)).
-  That is exact only because on this MLX and GPU a window of 2, 4 or 8 rows gives each row one-row bits. The
-  model checks this at load from a 48-token prompt and turns drafting off if it fails. On an M3 Ultra with MLX
-  0.32 the check probably fails, which would leave Nemotron correct but undrafted there.
-- The router is TensorFold's own matvec: MLX's bf16 matmul summed 2 rows in a different order than 1, a logit
-  one bf16 unit off at layer 29 of a real decode. Routing ties go to the lower expert id.
-- Attention picks its kernel by each row's own key count. Below the 10k switch a multi-row window runs MLX's
-  attention one query at a time over that row's keys.
-- The Mamba step returns the conv and SSM states after every row, so dropping a rejected tail keeps the state
-  after the last kept row; KV caches are trimmed.
+This section describes the Python 0.6.6 engine's CUDA family; its `--tp`, `--rank`, `--master` and `--prefill-fp8`
+flags are that engine's, and the native binary refuses them. The native CUDA build serves Nemotron on one GPU, from
+the MLX 4-bit checkpoint or NVIDIA's NVFP4 export, with concurrent requests sharing each round, and its own
+`--mtp-drafts` (at most 15 for this model) and `--mtp-confidence` set MTP drafts in lone and shared rounds; see the
+[native CUDA runbook](../../RUNBOOK.md#linux-and-cuda).
 
-## Next
+CUDA reads this model's MLX 4-bit checkpoint only; NVFP4 and EXL3 exports of it are not read yet. Its prompt matmuls
+have no FP8 kernel, so prompt precision does not change and `--prefill-fp8` is refused.
 
-- More than one MTP draft a round, with acceptance-driven depth as Flash Next does: untried here.
-- A quiet-machine server measurement of MTP rounds against copies only.
-- Tests for the fused kernels (row independence at real dims) and for the GPU sampler against its numpy
-  reference (`gpu_sampling.reference`).
-- At long context the cost is attention.
+Use the [CUDA container setup](https://github.com/ashhart/TensorFold/blob/v0.6.6/RUNBOOK.md#nvidia-gpus). One or two
+ranks are supported.
+Pull the checkpoint on each rank and start rank 1 first:
+
+```bash
+tensorfold serve TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit --tp 2 --rank 1 --master 192.0.2.1
+tensorfold serve TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit --tp 2 --rank 0 --master 192.0.2.1 --name bench --host 0.0.0.0
+```
+
+The default cap is three MTP drafts. Later drafts stop when their cumulative head confidence falls below
+20%; the first draft is retained. `--mtp-drafts N` sets a cap from zero to eight. Context copies can also
+supply proposals, and verification uses windows of up to 16 rows.
+
+The shared grouped expert kernel handles routed experts and two half-width shared experts. Mamba
+convolution and recurrent state commit by replaying the kept rows before the next window. Attention
+uses fixed 512-key chunks and merges them in order. Prefill uses separate prompt-chunk kernels.
+
+Requests take turns. The engine retains prompt and reply states for prefix reuse; `"draft": false`
+uses a separate serial engine. The default requested context is 16,384 tokens, subject to startup
+memory admission; `--context` sets an explicit window. Inspect the reported capacity before sending
+long requests. Both backends use the same public draft list below.
+
+## Native Omni video
+
+The maintained CUDA Bolt family shares RADIO with image input. See the [video recipe](nemotron-omni-video.md)
+for checkpoint requirements, request parts, limits and qualification status.
+
+## Draft vocabulary provenance
+
+This section describes the Python 0.6.6 engine's list,
+[`src/tensorfold/families/nemotron_h/draft_ids.txt`](https://github.com/ashhart/TensorFold/blob/v0.6.6/src/tensorfold/families/nemotron_h/draft_ids.txt).
+The native engine embeds its own 49,152-ID list, `zig/src/families/nemotron/draft_ids.txt`, on Metal and CUDA; the
+rebuild below does not produce it.
+
+The shipped `draft_ids.txt` contains 32,768 sorted IDs. It can be rebuilt byte for byte from CPython
+3.14.5's standard-library Python files, excluding `site-packages`, plus tracked Python and Markdown
+files from TensorFold commit `cfea94372391f3761d42d0d8946462adf28a68b4`.
+No PyPI package source or working-tree text is part of this corpus.
+
+Tokenizer JSON SHA-256:
+
+```text
+623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7
+```
+
+Use `tokenizers==0.22.2` and the archived commit's `tools/draft_vocab.py`, whose SHA-256 is
+`980f3d0c3520260d49841b85b5298b08109b7148e99fb5d7a03f4011df7b26a4`.
+Place the matching tokenizer at `tokenizer.json`. In an empty output directory within a repository clone,
+export the tracked corpus and copy a clean CPython 3.14.5 stdlib:
+
+```bash
+git archive --format=tar --prefix=corpus/tensorfold/ cfea94372391f3761d42d0d8946462adf28a68b4 | tar -xf -
+python3.14 -B - <<'PYTHON'
+from pathlib import Path
+import shutil
+import sys
+import sysconfig
+assert sys.version_info[:3] == (3, 14, 5)
+source = Path(sysconfig.get_path("stdlib")).resolve()
+for path in sorted(source.rglob("*.py")):
+    rel = path.relative_to(source)
+    if "site-packages" in rel.parts or "__pycache__" in rel.parts:
+        continue
+    path.resolve().relative_to(source)
+    dest = Path("corpus/cpython") / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, dest)
+PYTHON
+TOKENIZERS_PARALLELISM=false python3 -B corpus/tensorfold/tools/draft_vocab.py tokenizer.json draft_ids.txt --size 32768 --min-count 1 'corpus/cpython/**/*.py' 'corpus/tensorfold/**/*.py' 'corpus/tensorfold/**/*.md'
+```
+
+The verified stdlib came from Homebrew CPython 3.14.5. The selected corpus contains 1,849 stdlib Python
+files and 173 package Python/Markdown files. The generator reads 1,995 nonempty UTF-8 files and
+10,172,943 tokens. It skips unreadable files and text over its default 2,000,000-character limit.
+It keeps IDs below 1024, then IDs by frequency, then the lowest unused IDs until full.
+
+Expected output SHA-256:
+
+```text
+436840405e3507339efe85c410bb87a927ede7eb44eae620c0dda225c392d45f
+```
+
+A different stdlib distribution can change the selected files. Check the output hash before adopting a
+rebuild. This subset affects draft proposals only; the target still verifies against its full vocabulary.
+
+## Native prompt reuse
+
+The Zig engine keeps a stream's prompt state at each planned chunk end: every Mamba conv and SSM state, the KV rows and
+the draft head's KV rows (`zig/src/families/nemotron/snapshot.zig`). A later request whose prompt extends a kept state
+resumes there. Both the keep and the resume are copies on the GPU, on the engine's own queue, so neither waits for the
+host. `--prompt-cache-gib` sizes the memory as for Flash Next; `0` turns it off.
+
+Measured on an M5 Ultra (256 GB), macOS 27.0.1, Zig 0.17.0, checkpoint revision `d9d758fb`, with
+`--context 32768 --temperature 0 --no-thinking`, greedy, 96 reply tokens, a 9.2k-token chat over four turns:
+
+| | Turns 2-4, cache off | Turns 2-4, cache on |
+| --- | --- | --- |
+| Prompt time | 1.29-1.36 s | 0.28-0.31 s, 9,213 tokens resumed (turn 4: 9,556) |
+
+A fresh 9.2k-token prompt costs the same with the cache on or off: 1.07 s mean over four prompts each way, alternated,
+while the cache keeps two states (106 MiB each) per prompt. Every reply equalled its cache-off reply: one conversation
+alone, two conversations at once with `--parallel 4` (each equal to its solo run), and `--no-drafts`; drafted output
+equalled `--no-drafts` throughout.
+
+`--learn` keeps the states at shared cuts (a system prompt and its tools) on disk, under an identity made of the
+checkpoint's config and tensor index, each shard file's size, inode and change times, the prefill step, the head,
+every kernel source, a probe's prompt-pass bits, the OS build and the chip
+(`zig/src/families/nemotron/learned_prompts.zig`). Weights that `--slide` writes into the shards start a new identity,
+and a live weight change stops the server reading or writing learned states until it restarts. The probe runs a fixed
+4,143-token prompt at startup, about a second. A later server with the same identity reads a learned state back and
+resumes a fresh conversation from it: with the 9.2k-token system prompt above, a new server's first turn took 0.27 s
+instead of 1.30 s, resuming 9,213 tokens from disk, and every reply equalled the cache-off reply. The two learned
+states took 213 MB on disk.
+
+## Routed experts past one row
+
+Windows and shared rounds take the routed experts through `tf_experts_w` (`zig/kernels/metal/nemotron_experts.metal`):
+a 16-group's four weight words as the outer loop, three member rows a pass, four simdgroups a threadgroup. Each lane
+sums in the one-row kernel's order, so every width gives the one-row bits; `zig build tf-nemotron-experts` checks that
+and times the shapes. On an M5 Ultra the 23 layers' up and down projections went from 2.35 to 2.27 ms at 4 rows, 6.68
+to 6.48 at 16, 11.93 to 11.24 at 32 and 22.57 to 20.58 at 64 (equal at 2). Served with the cache off, alternated twice
+against the previous kernel: one stream 503 to 513 tok/s on code and 348 to 351 on prose, 8 streams 947 to 985 and 713
+to 731 tok/s in all, 32 streams 792 to 802 and 752 to 761, every reply equal to its solo and its plain run.
+
+## Measurements
+
+Use the [public benchmark command](README.md#measurements) with the server above.
+Compare drafted/serial and resumed/fresh output on each backend and rank count, plus concurrent/solo
+requests on MLX. Decode rate, cold/resumed first-token latency and peak memory are TBD [release-0.3.5].
+
+On a 64 GB M5 Pro with TensorFold 0.3.5.1 and `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit@8bbcb5b6`
+(#70; setup in the [Qwen3.8-27B recipe](qwen3.8-27b.md#a-64-gb-m5-pro-on-0351)), the fitted context was the full
+262,144 tokens and the lifetime peak footprint 42.21 GiB, reached during load and warm-up. A 261,780-token prompt
+prefilled in 311.5 s and resumed in 0.63 s with 261,774 tokens cached. Decode medians were 146.0, 123.3, 131.3 and
+135.3 tok/s with MTP (code sampled, chat sampled, code greedy, chat greedy) and 107.8, 109.0, 109.5 and 109.0 with
+`--no-drafts`. All 180 concurrent replies at 1, 2, 4 and 8 streams equaled their solo runs, and every solo run
+equaled `"draft": false`. These are 0.3.5.1 results, not a later release's.
+
+## Shared rounds on the Zig engine
+
+The native server runs every live stream's window in one forward. That forward holds four rows a lane (`--parallel`),
+64 at least and 128 at most, so up to `--parallel 16` nothing changes from the 64-row buffers the engine always
+allocated, and at 32 or 64 lanes each drafting stream keeps rows for its drafts instead of the round splitting. Each
+row past 64 costs one Mamba state slot, 2 MiB a Mamba layer, 47 MiB across Lightning's 23, so `--parallel 64` takes
+about 2.9 GiB more than before and `--parallel 8` the same. The startup timing sweep times shared rounds up to that
+width, so the planner prices them from measurements rather than a straight line past 32.
+
+Measured on an M5 Ultra (256 GB, macOS 27.0.1) with `--parallel 64 --context 32768 --prompt-cache-gib 0`, 256
+tokens a reply, greedy, two alternated rounds, `tools/bench_concurrent.py --alone --serial`:
+
+| Sessions | Code, before | Code, after | Chat, before | Chat, after |
+|---|---|---|---|---|
+| 8 | 939-944 tok/s | 944-953 | 717-721 | 713-717 |
+| 32 | 779-795 | 958-1,019 | 740-755 | 843 |
+| 64 | 779-795 | 968-1,006 | 738-753 | 847-849 |
+
+Every concurrent reply equaled its solo run and every solo run equaled `"draft": false` (832 replies checked a
+binary). One stream decodes the same as before: 505 and 347 tok/s on the two decode prompts. A 64-row cap alone,
+measured on the way, gave most of the 32-session gain and a quarter of the 64-session one.
+
+## Stream memory on CUDA
+
+The native CUDA engine keeps one sequence of its own at the full `--context` window, as before; its captured graphs
+and the lone stream's fast path read it. Every other stream takes its key and value rows from one pool of 512-row
+pages (`zig/src/core/kv_pool.zig`), which the engine fills from the room its own sequence and the weights leave:
+each further stream's fixed part (Mamba states, window scratch, its page table: 64 MiB), the prompt cache's snapshot
+slots (48 MiB each, made at load) and its copied rows come first, then pages, never more than every stream could hold
+at once. A request reserves `ceil((prompt + max_tokens + 16) / 512)` pages when it is admitted: a 2,048-token prompt
+with 4,096 reply tokens takes 13 pages (45.5 MiB) instead of a whole window. A request whose pages do not fit waits
+until a stream ends. The attention kernels read the pages through a table at a fixed device address, so the graphs
+keep their addresses. The startup line shows the pool. `TF_KV_PAGES=0` gives every stream a window again;
+`TF_KV_PAGES=all` puts every stream on pages (for checks).
