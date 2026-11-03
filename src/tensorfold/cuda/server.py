@@ -15,6 +15,7 @@ A family's CUDA engine (``cuda_engine`` in its package) provides:
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import threading
@@ -27,12 +28,14 @@ from typing import Any, Callable
 
 _THINK_END = "</think>"
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+_CALL_OPEN_RE = re.compile(re.escape(_CALL_OPEN), re.IGNORECASE)
+_CALL_CLOSE_RE = re.compile(re.escape(_CALL_CLOSE), re.IGNORECASE)
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
 
-# -- text helpers (same rules as the Mac lane server) ---------------------------------------
+# -- text helpers (thinking and partial tags: same rules as the Mac lane server) ------------
 
 def _partial_tag(text: str, tag: str) -> int:
     for k in range(min(len(tag) - 1, len(text)), 0, -1):
@@ -83,20 +86,14 @@ def split_thinking(text: str, *, finished: bool) -> tuple[str, str]:
     return text[:end], text[end + len(_THINK_END):].lstrip("\n")
 
 
-def hide_tool_calls(text: str, *, finished: bool) -> str:
-    out: list[str] = []
-    pos = 0
-    while True:
-        start = text.find(_CALL_OPEN, pos)
-        if start < 0:
-            tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
-            return "".join(out)
-        out.append(text[pos:start])
-        end = text.find(_CALL_CLOSE, start)
-        if end < 0:
-            return "".join(out)
-        pos = end + len(_CALL_CLOSE)
+def unsettled(text: str) -> int:
+    """Where a tool call that has not closed starts (or a tail that could open one): ``parse_tool_calls`` takes it
+    as a call or keeps it as text only once it closes, so the stream waits there. A call has closed iff a closer
+    follows its opener, so the first opener after the last closer is the one still open."""
+
+    done = max((m.end() for m in _CALL_CLOSE_RE.finditer(text)), default=0)
+    opened = _CALL_OPEN_RE.search(text, done)
+    return opened.start() if opened else len(text) - _partial_tag(text[-len(_CALL_OPEN):].lower(), _CALL_OPEN)
 
 
 def _tool_name(tool: dict[str, Any]) -> str:
@@ -245,6 +242,10 @@ class App:
         stopped = {"client": False}
         stream = StreamDecoder(self.tok, tuple(self.engine.eos))
 
+        # While a call is open the settled text does not change, so it is not parsed again.
+        # ponytail: text after a long closed call re-parses each round; parse incrementally if such replies show up
+        settled = functools.lru_cache(maxsize=1)(lambda text: parse_tool_calls(text, tools)[0])
+
         def visible(finished: bool) -> tuple[str, str]:
             raw = stream.final() if finished else stream.text
             if chat and thinking:
@@ -252,7 +253,7 @@ class App:
             else:
                 reasoning, answer = "", raw
             if tools:
-                answer = hide_tool_calls(answer, finished=finished)
+                answer = settled(answer if finished else answer[:unsettled(answer)])
             return reasoning, answer
 
         def on_tokens(new: list[int]) -> bool:
